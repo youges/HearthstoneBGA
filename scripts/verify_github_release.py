@@ -7,13 +7,16 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import urllib.request
 import zipfile
 
 ROOT=Path(__file__).resolve().parents[1]
+sys.path.insert(0,str(ROOT/'src'))
+from bga import __version__
 REPO='https://github.com/youges/HearthstoneBGA'
 parser=argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--tag',default='v0.2.1')
+parser.add_argument('--tag',default='v'+__version__)
 TAG=parser.parse_args().tag
 import re
 assert re.fullmatch(r'v\d+\.\d+\.\d+',TAG),'Invalid release tag'

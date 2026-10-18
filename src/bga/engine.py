@@ -39,6 +39,7 @@ class Engine:
         self.board_unknown_since = None
         self.target_pending_since = None
         self.hand_probe=None
+        self.pending_hand_play=None
         self.hand_skipped=set()
         self.shop_spell_skipped=set()
         self.shop_spell_bought=False
@@ -49,7 +50,10 @@ class Engine:
     def reset_observation(self):
         self.board_unknown_since=None
         self.hand_probe=None
+        self.pending_hand_play=None
         self.hand_skipped.clear()
+        self.probes_this_turn=0
+        self.probe_cursor=0
         self.stable = 0
         self.last_metrics = {}
         self.confirmed_metrics = {}
@@ -59,6 +63,27 @@ class Engine:
 
     def signature(self, obs):
         return (obs.state, tuple(sorted(obs.metrics.items())), tuple(obs.hand_minions), tuple(obs.shop_minions), obs.board_count)
+
+    def refresh_consumed_hand(self, obs):
+        """Re-inspect shifted cards only after a verified cast has completed."""
+        pending=self.pending_hand_play
+        if not pending or obs.state!=State.RECRUIT or obs.metrics.get('targeting_arrow')==1:
+            return
+        if pending.get('target_expected') and not pending.get('target_clicked'):
+            return
+        old=pending.get('precast_hand_count')
+        count=self.confirmed_metrics.get('hand_count')
+        if old is None or count is None or count>=old:
+            return
+        if pending.get('precast_hand_kind')=='buff':
+            self.target_pending_since=None
+        self.pending_hand_play=None
+        self.hand_probe=None
+        self.hand_skipped.clear()
+        # Three failed inspections are allowed per unchanged hand, rather
+        # than limiting a whole recruit phase to three inspections.
+        self.probes_this_turn=0
+        self.probe_cursor=0
 
     def feedback(self, action, before, after):
         """Only action-specific feedback counts as success, not any changed OCR."""
@@ -74,6 +99,8 @@ class Engine:
             return (after.state==State.RECRUIT and before.board_count==7 and after.board_count==6
                     and old is not None and new is not None and new>=old+1)
         if action.target=='inspected_hand':
+            if before.metrics.get('precast_hand_kind')=='buff' and after.metrics.get('targeting_arrow')==1:
+                return False
             count=self.confirmed_metrics.get('hand_count')
             old=before.metrics.get('precast_hand_count')
             if before.metrics.get('precast_hand_kind')=='steal':
@@ -128,6 +155,7 @@ class Engine:
             if obs.state in (State.COMBAT,State.RESULT,State.LOBBY):
                 self.target_pending_since=None
                 self.hand_probe=None
+                self.pending_hand_play=None
                 self.hand_skipped.clear()
                 self.shop_spell_skipped.clear()
                 self.shop_spell_bought=False
@@ -208,12 +236,18 @@ class Engine:
             if self.clock() - self.state_since > self.config.state_timeout:
                 raise NeedsAttention('画面长期无法可靠识别，需要检查模板和窗口状态')
             return None
+        self.refresh_consumed_hand(obs)
         if obs.state==State.RECRUIT and obs.metrics.get('targeting_arrow')==1 and (
-            self.target_pending_since is not None or re.search(r'选择一个|获得[+＋]',obs.evidence)):
+            self.target_pending_since is not None or
+            self.pending_hand_play and self.pending_hand_play.get('precast_hand_kind')=='buff' or
+            re.search(r'选择一个|获得[+＋]',obs.evidence)):
             if not self.last_action or self.last_action.target!='friendly_target':
                 if (obs.metrics.get('friendly_target_verified')==1 or obs.board_count) and 'friendly_target' in obs.targets:
                     return self.action('click','选择已高亮的友方随从目标',obs,'friendly_target')
                 return None
+            if self.clock()-self.last_action_time>=8:
+                raise NeedsAttention('指向性效果未完成目标选择，已暂停')
+            return None
         if self.last_action and self.last_action.target=='hero_confirm' and obs.state==State.HERO:
             # Confirmation may leave the ready/waiting overlay up until all
             # eight players finish. Never select or confirm again while waiting.
@@ -413,14 +447,20 @@ class Engine:
         self.before_action = obs
         if action.target=='inspected_hand':
             self.hand_probe=None
-            self.hand_skipped.clear()
+            self.pending_hand_play={k:obs.metrics.get(k) for k in ('precast_hand_count','precast_hand_kind')}
+            if obs.metrics.get('precast_hand_kind')=='buff':
+                self.target_pending_since=self.clock()
         if action.target=='inspected_shop_spell':
             self.hand_probe=None
             self.shop_spell_bought=True
         if action.source_state==State.CHOICE:
             self.target_pending_since=self.clock() if obs.metrics.get('choice_targeted') else None
+            if self.pending_hand_play and obs.metrics.get('choice_targeted'):
+                self.pending_hand_play['target_expected']=True
         if action.target=='friendly_target':
             self.target_pending_since=None
+            if self.pending_hand_play:
+                self.pending_hand_play['target_clicked']=True
         if action.target=='sell_minion':
             self.sold_for_space=True
         if action.source_state == State.HERO and action.target in ('hero_2','hero_3'):
