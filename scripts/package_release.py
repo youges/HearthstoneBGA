@@ -44,6 +44,9 @@ def docs(destination):
     destination.mkdir(parents=True)
     for name in ['使用说明.md','功能文档.md','版本说明-0.2.0.md']:
         shutil.copy2(ROOT/'docs'/name,destination/name)
+    version_notes=ROOT/'docs'/f'版本说明-{__version__}.md'
+    if version_notes.exists() and not (destination/version_notes.name).exists():
+        shutil.copy2(version_notes,destination/version_notes.name)
     shutil.copy2(ROOT/'docs/功能文档.md',destination/'开发文档.md')
 
 
@@ -116,7 +119,7 @@ def main():
         with zipfile.ZipFile(path) as check:assert check.testzip() is None
         records.append(dict(file=name,bytes=path.stat().st_size,sha256=hashlib.sha256(path.read_bytes()).hexdigest()))
     (release/'SHA256SUMS.txt').write_text(''.join(f'{r["sha256"]}  {r["file"]}\n' for r in records),encoding='utf-8')
-    shutil.copy2(ROOT/'docs/版本说明-0.2.0.md',release/'RELEASE_NOTES.md')
+    shutil.copy2(ROOT/'docs'/f'版本说明-{__version__}.md',release/'RELEASE_NOTES.md')
     report=dict(version=__version__,passed=True,checks=checks,archives=records,
                 staging=str(staging),github_published=False)
     (release/'package-verification.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')

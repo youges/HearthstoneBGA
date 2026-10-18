@@ -64,5 +64,7 @@ jobs:
           gh release view $tag --repo $env:GITHUB_REPOSITORY --json id 2>$null
           if ($LASTEXITCODE -eq 0) { Write-Output 'Release already exists; existing assets were preserved.'; exit 0 }
           $assets = @((Join-Path $releaseFolder "HearthstoneBGA-$version-windows-x64.zip"), (Join-Path $releaseFolder "HearthstoneBGA-$version-source.zip"), (Join-Path $releaseFolder 'SHA256SUMS.txt'))
-          gh release create $tag @assets --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "HearthstoneBGA $version（开发测试版）" --notes-file 'docs/版本说明-0.2.0.md' --prerelease
+          $notesFile = Join-Path 'docs' "版本说明-$version.md"
+          if (-not (Test-Path -LiteralPath $notesFile)) { throw "Missing release notes: $notesFile" }
+          gh release create $tag @assets --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "HearthstoneBGA $version（开发测试版）" --notes-file $notesFile --prerelease
           if ($LASTEXITCODE -ne 0) { throw 'Release upload failed' }

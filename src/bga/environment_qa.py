@@ -32,6 +32,14 @@ def run_environment_qa():
         assert abs(rect[2]/rect[3]/(16/9)-1)<.01
         assert frame.shape[:2]==(rect[3],rect[2])
         assert not target.adapt_resolution(16/9)['changed']
+        widget.showFullScreen();app.processEvents();time.sleep(.3)
+        fullscreen_before=target.rect()
+        fullscreen=target.adapt_resolution(16/9)
+        app.processEvents()
+        assert fullscreen['mode']=='fullscreen' and not fullscreen['changed']
+        assert target.rect()==fullscreen_before,'适配不应移动或缩小全屏窗口'
+        report.update(fullscreen_before=fullscreen_before,fullscreen_adapter=fullscreen,
+                      fullscreen_after=target.rect(),fullscreen_preserved=True)
         path,source=detect_battle_net()
         registry_path,registry_source=detect_battle_net('',running=[])
         assert path and registry_path,'未安装战网或未找到客户端'

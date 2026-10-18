@@ -2,6 +2,13 @@
 import math
 
 
+def covers_monitor(client_rect, monitor_rect, tolerance=2):
+    """Compare physical client edges, including monitors with negative origins."""
+    x,y,width,height=client_rect
+    edges=(x,y,x+width,y+height)
+    return all(abs(a-b)<=tolerance for a,b in zip(edges,monitor_rect))
+
+
 def fit_client(work_area, border, aspect, minimum=(960,540)):
     left,top,right,bottom=work_area
     bx,by=border

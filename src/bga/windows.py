@@ -56,6 +56,8 @@ user32.AttachThreadInput.restype = W.BOOL
 kernel32.GetCurrentThreadId.restype = W.DWORD
 user32.GetClientRect.argtypes = [W.HWND,C.POINTER(W.RECT)]
 user32.GetWindowRect.argtypes = [W.HWND,C.POINTER(W.RECT)]
+user32.GetWindowLongW.argtypes = [W.HWND,C.c_int]
+user32.GetWindowLongW.restype = W.LONG
 user32.SetWindowPos.argtypes = [W.HWND,W.HWND,C.c_int,C.c_int,C.c_int,C.c_int,W.UINT]
 user32.SetWindowPos.restype = W.BOOL
 user32.ClientToScreen.argtypes = [W.HWND,C.POINTER(W.POINT)]
@@ -164,16 +166,27 @@ class Window:
             raise WindowUnavailable('操作位置被其他窗口遮挡；已停止输入')
 
     def adapt_resolution(self,aspect):
-        from .adaptation import fit_client,needs_fit
+        from .adaptation import covers_monitor,fit_client,needs_fit
         info=MONITORINFO();info.cbSize=C.sizeof(info)
         monitor=user32.MonitorFromWindow(self.hwnd,2)
         if not user32.GetMonitorInfoW(monitor,C.byref(info)):
             raise WindowUnavailable('无法获取目标显示器工作区')
         wr=info.rcWork;work=(wr.left,wr.top,wr.right,wr.bottom)
+        mr=info.rcMonitor;monitor_rect=(mr.left,mr.top,mr.right,mr.bottom)
         outer=W.RECT()
         if not user32.GetWindowRect(self.hwnd,C.byref(outer)):
             raise WindowUnavailable('无法读取目标窗口边框')
         current=self.rect();outer_rect=(outer.left,outer.top,outer.right,outer.bottom)
+        # A borderless fullscreen client legitimately covers the taskbar area.
+        # Never restore or resize it using the smaller desktop work area.
+        style=user32.GetWindowLongW(self.hwnd,-16)
+        fullscreen=not (style & (0x00C00000 | 0x00040000)) and covers_monitor(current,monitor_rect)
+        if fullscreen:
+            if needs_fit(current,monitor_rect,monitor_rect,aspect):
+                raise WindowUnavailable('全屏画面比例或尺寸不符合当前校准，请切换窗口模式后重试自动适配')
+            return dict(client_rect=current,work_area=work,monitor_area=monitor_rect,
+                        dpi=int(user32.GetDpiForWindow(self.hwnd) or 96),aspect=aspect,
+                        changed=False,mode='fullscreen')
         changed=False
         if needs_fit(current,outer_rect,work,aspect):
             # Fullscreen modes are not forcibly toggled. A denied resize will fail validation.
@@ -192,7 +205,7 @@ class Window:
                 raise WindowUnavailable('窗口未接受适配尺寸，请切换窗口模式，或关闭自动适配后重新校准')
             changed=True
         return dict(client_rect=current,work_area=work,dpi=int(user32.GetDpiForWindow(self.hwnd) or 96),
-                    aspect=aspect,changed=changed)
+                    aspect=aspect,changed=changed,monitor_area=monitor_rect,mode='windowed')
 
 
 def find_windows():
