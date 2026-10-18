@@ -40,6 +40,15 @@ def parse_number(text: str, kind: str):
     return None
 
 
+def gold_fraction(text):
+    # On this calibrated integer counter OCR may read the slash as ':' or '.'.
+    # Preserve both numbers for cross-image agreement; never replace L with 7.
+    match=re.fullmatch(r'(\d{1,2})[/.:：](\d{1,2})',text.replace(' ',''))
+    if not match:return None
+    current,maximum=map(int,match.groups())
+    return (current,maximum) if 0<=current<=30 and 1<=maximum<=30 else None
+
+
 def classify_hand_text(tokens,min_type_y=.68):
     text=''.join(t.text.replace(' ','') for t in tokens)
     spell=any(t.text.strip() in ('酒馆','酒館','法术','酒馆法术') and t.center[1]>min_type_y for t in tokens)
@@ -167,17 +176,21 @@ class Vision:
         values = {parse_number(t.text, kind) for t in tokens if t.score >= .85}
         values.discard(None)
         if not values and kind=='gold' and hasattr(self.ocr,'recognize_line'):
-            wide=cv2.resize(roi,None,fx=4,fy=2,interpolation=cv2.INTER_CUBIC)
             gray=cv2.cvtColor(roi,cv2.COLOR_BGR2GRAY)
-            binary=cv2.threshold(gray,180,255,cv2.THRESH_BINARY)[1]
-            binary=cv2.cvtColor(cv2.resize(binary,None,fx=3,fy=3),cv2.COLOR_GRAY2BGR)
+            variants=[cv2.resize(roi,None,fx=4,fy=2,interpolation=cv2.INTER_CUBIC)]
+            for threshold,scale in ((180,(4,2)),(210,(3,3))):
+                binary=cv2.threshold(gray,threshold,255,cv2.THRESH_BINARY)[1]
+                binary=cv2.resize(binary,None,fx=scale[0],fy=scale[1],interpolation=cv2.INTER_NEAREST)
+                binary=cv2.copyMakeBorder(binary,12,12,20,20,cv2.BORDER_CONSTANT,value=0)
+                variants.append(cv2.cvtColor(binary,cv2.COLOR_GRAY2BGR))
             alternatives=[]
-            for variant in (wide,binary):
-                readings={parse_number(t.text,kind) for t in self.ocr.recognize_line(variant) if t.score>=.85}
+            for variant in variants:
+                readings={gold_fraction(t.text) for t in self.ocr.recognize_line(variant) if t.score>=.85}
                 readings.discard(None)
-                alternatives.append(readings.pop() if len(readings)==1 else None)
-            if alternatives[0] is not None and alternatives[0]==alternatives[1]:
-                return alternatives[0]
+                if len(readings)>1:return None
+                if readings:alternatives.append(readings.pop())
+            if len(alternatives)>=2 and len(set(alternatives))==1:
+                return alternatives[0][0]
         return values.pop() if len(values) == 1 else None
 
     def inspect_context(self,obs,image):
