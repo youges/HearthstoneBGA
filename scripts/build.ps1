@@ -1,6 +1,10 @@
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $projectRoot
+$portableExecutable = Join-Path $projectRoot 'dist\HearthstoneBGA\HearthstoneBGA.exe'
+foreach ($runningAssistant in @(Get-Process HearthstoneBGA -ErrorAction SilentlyContinue)) {
+    if ($runningAssistant.Path -eq $portableExecutable) { throw 'Close the portable assistant before rebuilding; user data must be idle.' }
+}
 $portableData = Join-Path $projectRoot 'dist\HearthstoneBGA\data'
 $portableBackup = $null
 if (Test-Path -LiteralPath $portableData) {
@@ -55,5 +59,9 @@ Copy-Item -Path "$projectRoot\docs\*.md" -Destination "$destination\docs"
 Copy-Item -LiteralPath "$projectRoot\research\ocr_model_manifest.json" -Destination "$destination\docs\ocr_model_manifest.json"
 if (Test-Path -LiteralPath "$projectRoot\THIRD_PARTY_NOTICES") {
     Copy-Item -LiteralPath "$projectRoot\THIRD_PARTY_NOTICES" -Destination $destination -Recurse
+}
+if ($portableBackup) {
+    & "$projectRoot\.venv\Scripts\python.exe" "$projectRoot\scripts\compact_build_backup.py" "$portableBackup"
+    if ($LASTEXITCODE -ne 0) { throw 'Backup cleanup failed; full recovery data was retained.' }
 }
 Write-Output "Built: $destination\HearthstoneBGA.exe"
