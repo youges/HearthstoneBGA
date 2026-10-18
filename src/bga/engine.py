@@ -1,0 +1,445 @@
+"""Deterministic decisions, independent from any Windows input."""
+import time
+import uuid
+import re
+
+from .config import Config
+from .model import Action, Match, Observation, State
+from .store import now_iso
+
+
+class NeedsAttention(RuntimeError):
+    pass
+
+
+class Engine:
+    def __init__(self, config: Config, store, log, clock=time.monotonic):
+        self.config, self.store, self.log, self.clock = config, store, log, clock
+        self.state = State.UNKNOWN
+        self.state_since = clock()
+        self.candidate, self.stable = State.UNKNOWN, 0
+        self.last_metrics = {}
+        self.confirmed_metrics = {}
+        self.match: Match | None = None
+        self.completed = 0
+        self.last_rating = None
+        self.hero_clicked = None
+        self.hero_attempts = 0
+        self.turn_actions = 0
+        self.last_action_time = -1000.0
+        self.last_action = None
+        self.before_action = None
+        self.last_signature = None
+        self.failures = 0
+        self.result_frames = 0
+        self.lobby_frames = 0
+        self.recruit_since = None
+        self.done = False
+        self.concede_sent = False
+        self.board_unknown_since = None
+        self.target_pending_since = None
+        self.hand_probe=None
+        self.hand_skipped=set()
+        self.shop_spell_skipped=set()
+        self.shop_spell_bought=False
+        self.probes_this_turn=0
+        self.probe_cursor=0
+        self.sold_for_space=False
+
+    def reset_observation(self):
+        self.board_unknown_since=None
+        self.hand_probe=None
+        self.hand_skipped.clear()
+        self.stable = 0
+        self.last_metrics = {}
+        self.confirmed_metrics = {}
+        self.state_since = self.clock()
+        self.last_action = None
+        self.last_signature = None
+
+    def signature(self, obs):
+        return (obs.state, tuple(sorted(obs.metrics.items())), tuple(obs.hand_minions), tuple(obs.shop_minions), obs.board_count)
+
+    def feedback(self, action, before, after):
+        """Only action-specific feedback counts as success, not any changed OCR."""
+        if action.target in ('hero_2','hero_3'):
+            return after.metrics.get('hero_selected_slot') == int(action.target[-1])
+        if action.target == 'upgrade':
+            old,new=before.metrics.get('tavern_tier'),after.metrics.get('tavern_tier')
+            return old is not None and new is not None and new>old
+        if action.target == 'friendly_target':
+            return after.state==State.RECRUIT and after.metrics.get('targeting_arrow')==0
+        if action.target=='sell_minion':
+            old=before.metrics.get('gold');new=self.confirmed_metrics.get('gold')
+            return (after.state==State.RECRUIT and before.board_count==7 and after.board_count==6
+                    and old is not None and new is not None and new>=old+1)
+        if action.target=='inspected_hand':
+            count=self.confirmed_metrics.get('hand_count')
+            old=before.metrics.get('precast_hand_count')
+            if before.metrics.get('precast_hand_kind')=='steal':
+                previous_shop=before.metrics.get('shop_card_count')
+                current_shop=self.confirmed_metrics.get('shop_card_count')
+                return (after.state==State.RECRUIT and previous_shop is not None and current_shop==previous_shop-1
+                        and old is not None and count is not None and count>=old)
+            old_gold,new_gold=before.metrics.get('gold'),after.metrics.get('gold')
+            return (count is not None and old is not None and count<old) or (old_gold is not None and new_gold is not None and new_gold>old_gold)
+        if action.target=='inspected_shop_spell':
+            old,new=before.metrics.get('gold'),after.metrics.get('gold')
+            previous_hand=before.metrics.get('hand_count')
+            current_hand=self.confirmed_metrics.get('hand_count')
+            return ((old is not None and new is not None and new<old) or
+                    (previous_hand is not None and current_hand is not None and current_hand>previous_hand))
+        if action.target=='choice_1':
+            return after.state!=before.state or after.metrics.get('choice_confirm_ready')==1
+        if action.kind == 'drag' and action.target.startswith('shop_'):
+            old,new=before.metrics.get('gold'),after.metrics.get('gold')
+            return len(after.hand_minions)>len(before.hand_minions) or (old is not None and new is not None and new<old)
+        if action.kind == 'drag' and action.target.startswith('hand_'):
+            return (before.board_count is not None and after.board_count is not None and after.board_count>before.board_count) or len(after.hand_minions)<len(before.hand_minions)
+        return after.state != before.state
+
+    def observe(self, obs: Observation):
+        if obs.state == self.candidate:
+            self.stable += 1
+        else:
+            self.candidate, self.stable = obs.state, 1
+            self.last_metrics = {}
+            self.confirmed_metrics = {}
+        # Numeric values must be seen twice, within the same state.
+        for key, value in obs.metrics.items():
+            if value is not None and self.last_metrics.get(key) == value:
+                self.confirmed_metrics[key] = value
+            else:
+                self.confirmed_metrics.pop(key, None)
+        self.last_metrics = dict(obs.metrics)
+        if self.stable < self.config.stable_frames:
+            return False
+        if obs.state != self.state:
+            old = self.state
+            self.state, self.state_since = obs.state, self.clock()
+            self.last_action = None
+            self.last_signature = None
+            self.failures = 0
+            self.board_unknown_since=None
+            self.log.emit(f'状态：{old.value} → {self.state.value}', confidence=obs.confidence)
+            if obs.state == State.RECRUIT and old != State.RECRUIT:
+                self.turn_actions = 0
+                self.recruit_since = self.clock()
+            if obs.state in (State.COMBAT,State.RESULT,State.LOBBY):
+                self.target_pending_since=None
+                self.hand_probe=None
+                self.hand_skipped.clear()
+                self.shop_spell_skipped.clear()
+                self.shop_spell_bought=False
+                self.probes_this_turn=0
+                self.sold_for_space=False
+        if self.config.observe_only:
+            return True
+        if obs.board_count is not None:
+            self.board_unknown_since=None
+        if not obs.trusted:
+            return True
+        if obs.state in (State.HERO, State.RECRUIT, State.COMBAT) and self.match is None:
+            self.match = Match(uuid.uuid4().hex, now_iso(), rating_before=self.last_rating)
+            if obs.state != State.HERO:
+                self.match.result_status = 'attached_in_progress'
+                self.match.rating_before = None
+            self.store.save(self.match)
+        if obs.state == State.RESULT and self.match:
+            self.result_frames += 1
+            self.match.placement = self.confirmed_metrics.get('placement', self.match.placement)
+            if self.confirmed_metrics.get('rating') is not None:
+                self.match.rating_after = self.confirmed_metrics['rating']
+            self.match.ended_at = self.match.ended_at or now_iso()
+            self.match.result_status = 'awaiting_lobby'
+            self.store.save(self.match)
+        if obs.state == State.LOBBY:
+            rating = self.confirmed_metrics.get('rating')
+            if self.match and self.match.ended_at:
+                self.lobby_frames += 1
+                if rating is not None or self.lobby_frames >= 4:
+                    self.match.rating_after = rating if rating is not None else self.match.rating_after
+                    self.match.result_status = ('complete' if self.match.placement is not None and self.match.rating_after is not None else 'partial')
+                    self.store.save(self.match)
+                    self.completed += 1
+                    self.log.emit(f'已完成 {self.completed} 局；名次 {self.match.placement}；分数 {self.match.rating_after}',match_id=self.match.id)
+                    self.match = None
+                    self.concede_sent = False
+                    self.hero_clicked = None
+                    self.hero_attempts = self.result_frames = self.lobby_frames = 0
+            elif self.match:
+                if self.concede_sent and rating is not None:
+                    self.match.ended_at=now_iso()
+                    self.match.rating_after=rating
+                    self.match.result_status='awaiting_lobby'
+                    self.store.save(self.match)
+                    self.log.emit('未捕获结算名次；保留空名次并核对大厅积分','WARNING',match_id=self.match.id)
+                elif not self.concede_sent:
+                    raise NeedsAttention('未观察到结算就返回大厅，当前场需检查，已停止自动开始')
+            if rating is not None:
+                self.last_rating = rating
+            if self.config.max_matches and self.completed >= self.config.max_matches:
+                self.done = True
+        return True
+
+    def action(self, kind, label, obs, target='', destination='', key=''):
+        if target and target not in obs.targets:
+            raise NeedsAttention(f'缺少已校准的操作坐标：{target}')
+        if destination and destination not in obs.targets:
+            raise NeedsAttention(f'缺少已校准的目标坐标：{destination}')
+        return Action(kind,label,target,destination,key,obs.state,obs.captured_at)
+
+    def decide(self, obs: Observation):
+        if self.config.observe_only or self.done:
+            return None
+        if self.clock() - self.last_action_time < self.config.action_seconds:
+            return None
+        if self.stable < self.config.stable_frames or obs.state != self.state:
+            return None
+        if obs.state == State.AUTH:
+            raise NeedsAttention('检测到账号认证，请用户手动处理')
+        if obs.state==State.UNKNOWN and self.hand_probe and self.hand_probe.get('stage')=='inspect':
+            # A tooltip opened by our own hover can hide the tavern anchor.
+            # Only move away here; any click/drag still needs a fresh trusted frame.
+            self.hand_probe['kind']=obs.metrics.get('hand_card_kind','unknown')
+            obs.targets['clear_tooltip']=(.97,.35)
+            return self.action('hover','收起遮挡识别区域的手牌说明',obs,'clear_tooltip')
+        if not obs.trusted or obs.state == State.UNKNOWN:
+            if self.clock() - self.state_since > self.config.state_timeout:
+                raise NeedsAttention('画面长期无法可靠识别，需要检查模板和窗口状态')
+            return None
+        if obs.state==State.RECRUIT and obs.metrics.get('targeting_arrow')==1 and (
+            self.target_pending_since is not None or re.search(r'选择一个|获得[+＋]',obs.evidence)):
+            if not self.last_action or self.last_action.target!='friendly_target':
+                if (obs.metrics.get('friendly_target_verified')==1 or obs.board_count) and 'friendly_target' in obs.targets:
+                    return self.action('click','选择已高亮的友方随从目标',obs,'friendly_target')
+                return None
+        if self.last_action and self.last_action.target=='hero_confirm' and obs.state==State.HERO:
+            # Confirmation may leave the ready/waiting overlay up until all
+            # eight players finish. Never select or confirm again while waiting.
+            if self.clock()-self.last_action_time>150:
+                raise NeedsAttention('确认英雄后等待开局超时')
+            return None
+        if self.last_action and not self.feedback(self.last_action,self.before_action,obs):
+            if self.clock()-self.last_action_time < 8:
+                return None
+            self.failures += 1
+            self.last_action = None
+            if self.failures >= 3:
+                raise NeedsAttention('连续操作后没有观察到预期变化，已暂停')
+        elif self.last_action:
+            self.log.emit('已观察到动作反馈',action=self.last_action.label)
+            self.failures = 0
+            self.last_action = None
+        mapping = {
+            State.LAUNCHER: ('launcher_play','从战网启动炉石传说'),
+            State.ENTRY: ('entry_continue','点击游戏入口'),
+            State.NOTICE: ('notice_close','关闭已识别的游戏公告'),
+            State.MAIN: ('main_modes','打开模式入口'),
+            State.MODES: ('mode_battlegrounds','进入酒馆战棋'),
+            State.DISCONNECT: ('reconnect','尝试重新连接'),
+        }
+        if obs.state in mapping:
+            target,label = mapping[obs.state]
+            return self.action('click',label,obs,target)
+        if obs.state == State.LOBBY:
+            if self.match is not None or self.stable < max(4,self.config.stable_frames):
+                return None
+            return self.action('click','开始匹配',obs,'lobby_play')
+        if obs.state == State.HERO:
+            if self.hero_clicked is not None:
+                if obs.metrics.get('hero_selected_slot') == self.hero_clicked:
+                    return self.action('click','确认已选英雄',obs,'hero_confirm')
+                if self.clock()-self.last_action_time > 15:
+                    raise NeedsAttention('英雄选择后未验证到高亮，请校准 hero_selected 标记')
+                return None
+            allowed = set(obs.available_heroes) & {2,3}
+            if not allowed:
+                if self.clock()-self.state_since > 15:
+                    raise NeedsAttention('无法确认中间两名英雄的可选状态')
+                return None
+            slot = self.config.preferred_hero if self.config.preferred_hero in allowed else min(allowed)
+            return self.action('click',f'选择第 {slot} 个可用英雄',obs,f'hero_{slot}')
+        if obs.state == State.RESULT:
+            if not self.match or not self.match.ended_at:
+                raise NeedsAttention('没有当前场记录，不能自动跳过无法归属的结算')
+            # Allow up to six stable result observations for OCR before dismissing.
+            if self.result_frames < 3 or (self.match.placement is None and self.result_frames < 6):
+                return None
+            return self.action('click','结算已记录，返回大厅',obs,'result_continue')
+        if obs.state == State.MENU:
+            if self.config.test_concede and self.match:
+                return self.action('click','测试：点击认输',obs,'concede')
+            raise NeedsAttention('出现 Esc 菜单，请手动处理或开启测试退出')
+        if obs.state == State.CONFIRM:
+            if self.config.test_concede and self.match and self.match.end_reason == 'test_concede':
+                return self.action('click','测试：确认认输',obs,'confirm_concede')
+            raise NeedsAttention('意外确认对话框，需要检查')
+        if obs.state == State.CHOICE:
+            if obs.metrics.get('choice_confirm_ready')==1:
+                return self.action('click','确认已选择的局内选项',obs,'choice_confirm')
+            return self.action('click','处理已识别的发现选项',obs,'choice_1')
+        if obs.state == State.RECRUIT:
+            if self.target_pending_since is not None:
+                if obs.metrics.get('targeting_arrow')==1:
+                    if (obs.board_count or obs.metrics.get('friendly_target_verified')==1) and 'friendly_target' in obs.targets:
+                        return self.action('click','为已选择的指向性效果选取友方随从',obs,'friendly_target')
+                    return None
+                if self.clock()-self.target_pending_since<8:
+                    return None
+                self.log.emit('选择后未验证到指向箭头，未发送随从目标点击','WARNING')
+                self.target_pending_since=None
+            if self.concede_sent:
+                # Concession returns through a few live-board animation frames.
+                # Any extra shop/board click here can dismiss the result banner.
+                if self.clock()-self.state_since>90:
+                    raise NeedsAttention('认输后未进入结算，请检查游戏状态')
+                return None
+            if self.config.test_concede and self.recruit_since is not None and self.clock()-self.recruit_since >= self.config.concede_after_seconds:
+                return self.action('key','测试：打开 Esc 菜单',obs,key='Escape')
+            if self.turn_actions >= self.config.max_actions_per_turn:
+                return None
+            gold = self.confirmed_metrics.get('gold')
+            cost = self.confirmed_metrics.get('upgrade_cost')
+            tier = self.confirmed_metrics.get('tavern_tier')
+            reserve=0 if obs.board_count==7 else self.config.min_gold_after_upgrade
+            can_upgrade=(gold is not None and cost is not None and tier is not None and 1<=tier<6
+                         and cost<=self.config.upgrade_max_cost and gold-cost>=reserve)
+            if can_upgrade and (tier>=4 or obs.board_count==7) and not self.hand_probe:
+                return self.action('click',f'升级酒馆 {tier}→{tier+1}',obs,'upgrade')
+            if (self.config.auto_sell_for_space and obs.board_count==7 and not self.sold_for_space and not self.hand_probe
+                    and gold is not None and gold>=2 and obs.shop_minions and len(obs.hand_minions)<8
+                    and 'tavernkeeper' in obs.targets and 'friendly_target' in obs.targets):
+                obs.targets['sell_minion']=obs.targets['friendly_target']
+                return self.action('drag','卖出最左随从，为购买随从腾位',obs,'sell_minion','tavernkeeper')
+            if self.config.inspect_hand_cards:
+                if self.hand_probe:
+                    point=tuple(self.hand_probe['point'])
+                    if self.hand_probe.get('stage')=='inspect':
+                        kind=obs.metrics.get('hand_card_kind','unknown')
+                        if kind=='unknown' and self.clock()-self.hand_probe['since']<4:
+                            return None
+                        self.hand_probe['kind']=kind
+                        obs.targets['clear_tooltip']=(.97,.35)
+                        return self.action('hover','收起手牌说明并重新确认场面',obs,'clear_tooltip')
+                    kind=self.hand_probe.get('kind','unknown')
+                    if self.hand_probe.get('source')=='shop':
+                        name=self.hand_probe['name']
+                        present=any(abs(obs.targets[n][0]-point[0])<.025 for n in obs.shop_spells)
+                        spell_cost=self.confirmed_metrics.get(name+'_cost')
+                        if present and spell_cost is None and self.clock()-self.hand_probe.get('ready_since',0)<4:
+                            return None
+                        if (kind in ('buff','steal') or kind=='unknown' and spell_cost is not None and spell_cost<=3) and present and gold is not None and spell_cost is not None and gold>=spell_cost:
+                            obs.targets['inspected_shop_spell']=point
+                            return self.action('drag','测试：购买一张法术用于手牌识别',obs,'inspected_shop_spell','hand_drop')
+                        self.shop_spell_skipped.add(point);self.hand_probe=None
+                        return None
+                    present=any(abs(obs.targets[n][0]-point[0])<.025 and abs(obs.targets[n][1]-point[1])<.025 for n in obs.hand_minions)
+                    if kind in ('coin','discover','buff','minion','steal') and present and len(obs.hand_minions)==self.hand_probe['count']:
+                        obs.targets['inspected_hand']=point
+                        if kind=='minion' and (obs.board_count is None or obs.board_count>=7):
+                            if (self.config.auto_sell_for_space and obs.board_count==7 and not self.sold_for_space
+                                    and gold is not None and 'tavernkeeper' in obs.targets and 'friendly_target' in obs.targets):
+                                obs.targets['sell_minion']=obs.targets['friendly_target']
+                                return self.action('drag','卖出最左随从，为已识别随从腾位',obs,'sell_minion','tavernkeeper')
+                            self.hand_skipped.add(point);self.hand_probe=None
+                        elif kind=='buff' and (not obs.board_count or 'friendly_target' not in obs.targets):
+                            self.hand_skipped.add(point);self.hand_probe=None
+                        else:
+                            obs.metrics['precast_hand_count']=self.hand_probe['count']
+                            obs.metrics['precast_hand_kind']=kind
+                            destination='friendly_target' if kind=='buff' else 'board_drop'
+                            return self.action('drag',f'使用已读说明的手牌：{kind}',obs,'inspected_hand',destination)
+                    else:
+                        self.log.emit('未可靠读到手牌类型，本回合跳过该牌','WARNING',point=point)
+                        self.hand_skipped.add(point);self.hand_probe=None
+                names=obs.hand_minions
+                offset=self.probe_cursor%len(names) if names else 0
+                for name in names[offset:]+names[:offset]:
+                    point=tuple(obs.targets[name])
+                    if point not in self.hand_skipped and self.probes_this_turn<3:
+                        return self.action('hover','读取手牌说明',obs,name)
+                if self.config.test_shop_spells and not self.shop_spell_bought and obs.board_count and obs.board_count>=3:
+                    for name in obs.shop_spells:
+                        point=tuple(obs.targets[name]);spell_cost=self.confirmed_metrics.get(name+'_cost')
+                        if point not in self.shop_spell_skipped and gold is not None and spell_cost is not None and gold>=spell_cost:
+                            return self.action('hover','测试：读取商店法术说明',obs,name)
+            # Upgrading needs no board slot. In particular, unknown board
+            # occupancy or a full board must not block levels 4 -> 5 -> 6.
+            if can_upgrade:
+                return self.action('click',f'升级酒馆 {tier}→{tier+1}',obs,'upgrade')
+            if obs.board_count is None:
+                gold=self.confirmed_metrics.get('gold')
+                if not obs.hand_minions and (gold is None or gold<3):
+                    self.board_unknown_since=None
+                    return None
+                if self.board_unknown_since is None:
+                    self.board_unknown_since=self.clock()
+                    self.board_unknown_warned=False
+                if self.clock()-self.board_unknown_since > 20:
+                    # Skip uncertain recruit input, but keep observing combat and
+                    # settlement so a tooltip cannot suspend the whole match.
+                    if not self.board_unknown_warned:
+                        self.log.emit('无法确认场面空位，暂不操作并继续观察阶段变化','WARNING')
+                        self.board_unknown_warned=True
+                return None
+            self.board_unknown_since=None
+            if not self.config.inspect_hand_cards and obs.hand_minions and obs.board_count < 7:
+                return self.action('drag','将已识别随从打到场上',obs,obs.hand_minions[0],'board_drop')
+            if gold is None:
+                return None
+            if gold >= 3 and obs.shop_minions and obs.board_count < 7 and len(obs.hand_minions) < 8:
+                return self.action('drag','购买已识别随从',obs,obs.shop_minions[0],'hand_drop')
+        if self.clock()-self.state_since > self.config.state_timeout and obs.state not in (State.RECRUIT,State.COMBAT):
+            raise NeedsAttention(f'{obs.state.value} 状态等待超时')
+        return None
+
+    def sent(self, action, obs):
+        self.last_action_time = self.clock()
+        if action.kind=='hover':
+            if action.target=='clear_tooltip':
+                self.hand_probe['stage']='ready'
+                self.hand_probe['ready_since']=self.clock()
+            else:
+                self.hand_probe={'point':tuple(obs.targets[action.target]),'since':self.clock(),'count':len(obs.hand_minions),'stage':'inspect',
+                                 'source':'shop' if action.target.startswith('spell_shop_') else 'hand','name':action.target}
+                if not action.target.startswith('spell_shop_'):
+                    self.probes_this_turn+=1
+                    self.probe_cursor+=1
+            self.last_action=None
+            self.log.emit('已发送操作：'+action.label,kind=action.kind,target=action.target)
+            return
+        self.last_action, self.last_signature = action, self.signature(obs)
+        self.before_action = obs
+        if action.target=='inspected_hand':
+            self.hand_probe=None
+            self.hand_skipped.clear()
+        if action.target=='inspected_shop_spell':
+            self.hand_probe=None
+            self.shop_spell_bought=True
+        if action.source_state==State.CHOICE:
+            self.target_pending_since=self.clock() if obs.metrics.get('choice_targeted') else None
+        if action.target=='friendly_target':
+            self.target_pending_since=None
+        if action.target=='sell_minion':
+            self.sold_for_space=True
+        if action.source_state == State.HERO and action.target in ('hero_2','hero_3'):
+            self.hero_clicked = int(action.target[-1])
+            if self.match:
+                self.match.hero_slot = self.hero_clicked
+                self.store.save(self.match)
+        if action.source_state == State.MENU and action.target == 'concede' and self.match:
+            self.concede_sent=True
+            self.match.end_reason = 'test_concede'
+            self.store.save(self.match)
+        if action.source_state == State.RECRUIT:
+            self.turn_actions += 1
+        self.log.emit('已发送操作：'+action.label, kind=action.kind, target=action.target)
+
+    def interrupt(self):
+        if self.match and not self.match.ended_at:
+            self.match.ended_at = now_iso()
+            if self.match.end_reason=='normal':
+                self.match.end_reason = 'interrupted'
+            self.match.result_status = 'interrupted'
+            self.store.save(self.match)
