@@ -121,10 +121,10 @@ class Vision:
             self.cache[path] = content
         return self.cache[path]
 
-    def match(self, image, spec, region=None):
+    def match(self, image, spec, region=None, allow_pixel_rounding=False):
         if spec.get('alternatives'):
             primary={k:v for k,v in spec.items() if k!='alternatives'}
-            return max(self.match(image,s,region) for s in [primary,*spec['alternatives']])
+            return max(self.match(image,s,region,allow_pixel_rounding) for s in [primary,*spec['alternatives']])
         template = self.template(spec)
         native_image=image
         frame_w = spec.get('frame_size', [image.shape[1], image.shape[0]])[0]
@@ -147,9 +147,11 @@ class Vision:
             score=float(cv2.minMaxLoc(scores)[1])
             return score if np.isfinite(score) else 0.0
         score=score_patch(target,template)
-        if native_image.shape[1]<frame_w:
+        if native_image.shape[1]<frame_w or (allow_pixel_rounding and score<spec.get('threshold',.92)):
             # Small text crops suffer rounding by one pixel at a lower resolution.
             # Compare both the original normalization and nearby integer template sizes.
+            # Result labels also vary by one rendered pixel at native resolution;
+            # keep the calibrated search region and the original score threshold.
             scale=native_image.shape[1]/frame_w
             target=crop(native_image,region)
             for dw in [-1,0,1]:
@@ -260,18 +262,30 @@ class Vision:
                 return obs
         matches = []
         choice_point=None
+        choice_cards=None
+        choice_kind=None
         for name, spec in self.profile.anchors.items():
             if (name == 'launcher') != (window_kind == 'launcher'):
                 continue
             variants=[{k:v for k,v in spec.items() if k!='alternatives'},*spec.get('alternatives',[])]
             qualified=[]
             for variant in variants:
-                score=self.match(image,variant)
+                score=self.match(image,variant,allow_pixel_rounding=(name=='result'))
                 if score>=variant.get('threshold',.92):qualified.append((score,variant))
             if qualified:
                 score,variant=max(qualified,key=lambda x:x[0])
                 matches.append((score,State(name)))
-                if name=='choice':choice_point=variant.get('click_point')
+                if name=='choice':
+                    choice_point=variant.get('click_point')
+                    choice_kind=variant.get('kind')
+        if (window_kind=='game' and self.profile.layout_mode=='pc_v1'
+                and any(state==State.RECRUIT for _,state in matches)
+                and not any(state==State.CHOICE for _,state in matches)):
+            from .pc_layout import two_spell_choice_cards
+            choice_cards=two_spell_choice_cards(image)
+            if choice_cards:
+                matches.append((.98,State.CHOICE))
+                choice_point=choice_cards[0]
         matches.sort(reverse=True)
         # Modal overlays can leave an unchanged recruit header visible behind
         # them. A confirmed modal takes precedence over the underlying screen.
@@ -305,6 +319,14 @@ class Vision:
             if len(play)==1 and games:
                 obs.state,obs.confidence,obs.trusted=State.LAUNCHER,min(play[0].score,max(t.score for t in games)),True
                 obs.targets['launcher_play']=play[0].center
+        if obs.state==State.CHOICE and choice_kind=='hero_power':
+            from .pc_layout import hero_power_choice_point
+            choice_point=hero_power_choice_point(image)
+            if choice_point is None:
+                # The title blocks tavern actions even during card animations;
+                # stale calibrated discovery coordinates cannot select a skill.
+                obs.trusted=False
+                obs.targets.pop('choice_1',None)
         if obs.state==State.CHOICE and choice_point and 'choice_1' in obs.targets:
             if len(choice_point)==2 and all(0<float(x)<1 for x in choice_point):
                 obs.targets['choice_1']=tuple(choice_point)
@@ -313,6 +335,15 @@ class Vision:
             State.RECRUIT: ['gold','upgrade_cost','tavern_tier'],
         }.get(obs.state, [])
         obs.metrics = {name:self.read_metric(image,name,('rating_lobby' if obs.state==State.LOBBY else 'rating_result') if name=='rating' else name) for name in needed}
+        if obs.state==State.CHOICE and choice_kind=='hero_power':
+            obs.metrics.update(choice_kind='hero_power',choice_targeted=0)
+        if obs.state==State.CHOICE and choice_cards:
+            obs.metrics['choice_cards']=len(choice_cards)
+            # Only the selected option's description can request a later target.
+            # The underlying hand may still show an unrelated targeted spell.
+            selected_text=''.join(t.text for t in text_tokens if t.score>=.85
+                and abs(t.center[0]-choice_point[0])<.10 and .28<t.center[1]<.68)
+            obs.metrics['choice_targeted']=int(bool(re.search(r'使一个随从获|选择一个随从',selected_text)))
         self.inspect_context(obs,image)
         if self.profile.layout_mode == 'pc_v1' and obs.trusted:
             from .pc_layout import apply_pc_layout

@@ -85,6 +85,7 @@ class Match:
     ended_at: str | None = None
     result_status: str = 'in_progress'
     evidence_path: str | None = None
+    recovery_reason: str = ''
 
     @property
     def rating_delta(self):

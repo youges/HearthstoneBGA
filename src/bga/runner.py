@@ -73,10 +73,10 @@ class Runner(QThread):
                 missing = profile.missing()
                 if not profile.calibrated or missing:
                     raise ValueError('真实操作尚未启用：需完成校准。缺少：'+ '、'.join(missing[:8]))
-                if self.config.test_concede and any(x not in profile.anchors for x in ['menu','confirm']):
-                    raise ValueError('测试退出需要 Esc 菜单和确认框模板')
-                if self.config.test_concede and any(x not in profile.verified_points for x in ['concede','confirm_concede']):
-                    raise ValueError('测试退出需要校准认输与确认坐标')
+                if (self.config.test_concede or self.config.auto_concede_on_error) and any(x not in profile.anchors for x in ['menu','confirm']):
+                    raise ValueError('自动认输需要 Esc 菜单和确认框模板')
+                if (self.config.test_concede or self.config.auto_concede_on_error) and any(x not in profile.verified_points for x in ['concede','confirm_concede']):
+                    raise ValueError('自动认输需要校准认输与确认坐标')
                 if self.config.auto_sell_for_space and 'tavernkeeper' not in profile.verified_points:
                     raise ValueError('自动卖出需要校准酒馆老板头像位置')
             log.emit('正在初始化本地 OCR，首次加载可能稍慢')
@@ -97,6 +97,7 @@ class Runner(QThread):
                     self.engine.concede_sent=True
                 elif self.engine.match.end_reason=='interrupted':
                     self.engine.match.end_reason='normal'
+                self.engine.restore_concession()
                 self.engine.last_rating=self.engine.match.rating_before
                 log.emit('恢复本机未完成对局记录',match_id=self.engine.match.id)
             backend = WindowsBackend(self.stop_event,self.pause_event)
@@ -140,6 +141,8 @@ class Runner(QThread):
                     focused_hwnd=None
                     self.reset_requested.clear()
                 try:
+                    obs=None
+                    target=None
                     target = pick_window()
                     if target is None:
                         if self.config.auto_launch and not self.config.observe_only and launched_at is None:
@@ -239,6 +242,14 @@ class Runner(QThread):
                     continue
                 except (WindowUnavailable,NeedsAttention) as error:
                     message=str(error)
+                    if (isinstance(error,NeedsAttention) and obs is not None and target is not None
+                            and self.engine.begin_recovery(obs,error,target.kind)):
+                        evidence=self.snapshot(last_frame,'automatic_recovery')
+                        log.emit('异常现场已保存，开始认输恢复','WARNING',match_id=self.engine.match.id,
+                                 reason=message,evidence_path=evidence)
+                        self.status.emit('异常恢复中：正在打开认输菜单')
+                        self.records_changed.emit()
+                        continue
                     if isinstance(error,WindowUnavailable) and self.config.recover_focus and self.config.focus_on_start and ('不在前台' in message or '无法激活目标窗口' in message):
                         if message!=last_reported:
                             log.emit('目标失去前台，等待键鼠空闲后自动恢复；F8 暂停','WARNING')

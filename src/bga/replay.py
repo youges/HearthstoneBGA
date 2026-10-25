@@ -26,9 +26,11 @@ def run_replay(manifest,root=None):
             frame=cv2.imdecode(np.fromfile(local(case['image']),dtype=np.uint8),cv2.IMREAD_COLOR)
             if frame is None:raise ValueError('无法读取回放图像')
             obs=vision.analyze(frame)
-            passed=obs.state.value==case['state'] and all(obs.metrics.get(k)==v for k,v in case['metrics'].items())
+            passed=(obs.state.value==case['state']
+                    and all(obs.metrics.get(k)==v for k,v in case['metrics'].items())
+                    and ('trusted' not in case or obs.trusted==case['trusted']))
             report['checks'].append(dict(match_id=case['match_id'],image=case['image'],
-                state=obs.state.value,confidence=obs.confidence,metrics=obs.metrics,passed=passed))
+                state=obs.state.value,confidence=obs.confidence,trusted=obs.trusted,metrics=obs.metrics,targets=obs.targets,passed=passed))
         report['passed']=bool(report['checks']) and all(x['passed'] for x in report['checks'])
     except Exception as error:
         report['error']=f'{type(error).__name__}: {error}'

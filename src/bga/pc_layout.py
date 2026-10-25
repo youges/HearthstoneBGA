@@ -9,6 +9,64 @@ def count(mask,x1,y1,x2,y2):
     return cv2.countNonZero(mask[y1:y2,x1:x2])
 
 
+def hero_power_choice_point(image):
+    """Locate a complete selectable power card under a verified choice title.
+
+    Hovering enlarges and recolors a card, so use the leftmost complete green
+    outline rather than a fixed center or a count of all visible cards.
+    """
+    frame=cv2.resize(image,(1536,864),interpolation=cv2.INTER_AREA)
+    green=cv2.inRange(cv2.cvtColor(frame,cv2.COLOR_BGR2HSV),(40,110,120),(85,255,255))
+    # A gold mana crest can split a card's top glow into two components.
+    # Pair long upright edges instead of joining across nearby shop artwork.
+    top,bottom=285,490
+    columns=np.mean(green[top:bottom]>0,axis=0)>.70
+    edges=np.diff(np.r_[False,columns,False].astype(np.int8))
+    runs=[(int(a),int(b)) for a,b in zip(np.where(edges==1)[0],np.where(edges==-1)[0])
+          if 280<=a and b<=1260 and 2<=b-a<=30]
+    for (left,le),(right,re) in zip(runs,runs[1:]):
+        x1,x2=(left+le)/2,(right+re)/2
+        if 230<=x2-x1<=285:
+            density=np.mean(green[top:bottom,le:right]>0)
+            if density<.35:
+                return (float(x1+x2)/2/1536,float(top+bottom)/2/864)
+    return None
+
+
+def two_spell_choice_cards(image):
+    """Find two large selectable card outlines above a still-visible tavern.
+
+    Some battlecries offer cards without a choice title or minion-tier corner.
+    Both complete, aligned outlines are required; text and card artwork alone
+    never authorize selection. Coordinates are normalized to the client area.
+    """
+    frame=cv2.resize(image,(1536,864),interpolation=cv2.INTER_AREA)
+    green=cv2.inRange(cv2.cvtColor(frame,cv2.COLOR_BGR2HSV),(40,110,120),(85,255,255))
+    # The mana gem breaks the left glow into separate pieces. Close small gaps,
+    # then verify the original pixels along both upright edges of each card.
+    connected=cv2.morphologyEx(green,cv2.MORPH_CLOSE,np.ones((21,21),np.uint8))
+    _,_,stats,_=cv2.connectedComponentsWithStats(connected)
+    cards=[]
+    for x,y,w,h,area in stats[1:]:
+        if not (350<=x and x+w<=1190 and 220<=y<=310
+                and 225<=w<=295 and 260<=h<=330 and .06<=area/(w*h)<=.40):
+            continue
+        left=np.any(green[y:y+h,x:x+35],axis=1).mean()
+        right=np.any(green[y:y+h,x+w-35:x+w],axis=1).mean()
+        if min(left,right)<.70:
+            continue
+        cards.append((int(x),int(y),int(w),int(h)))
+    if len(cards)!=2:
+        return None
+    cards.sort()
+    (x1,y1,w1,h1),(x2,y2,w2,h2)=cards
+    c1,c2=x1+w1/2,x2+w2/2
+    if not (500<=c1<=650 and 885<=c2<=1035 and abs(c1+c2-1536)<=45
+            and abs(y1-y2)<=15 and abs(h1-h2)<=20 and abs(w1-w2)<=30):
+        return None
+    return [(float(x+w/2)/1536,float(y+h/2)/864) for x,y,w,h in cards]
+
+
 def shop_spell_cost(ocr,roi):
     if not hasattr(ocr,'recognize_line'):return None
     def read(image):
@@ -124,7 +182,7 @@ def apply_pc_layout(vision,image,obs):
     hsv=cv2.cvtColor(frame,cv2.COLOR_BGR2HSV)
     purple=cv2.inRange(hsv,(125,110,50),(175,255,255))
     if obs.state==State.CHOICE:
-        obs.metrics['choice_targeted']=int(bool(re.search(r'使一个随从获|选择一个随从',obs.evidence)))
+        obs.metrics.setdefault('choice_targeted',int(bool(re.search(r'使一个随从获|选择一个随从',obs.evidence))))
         if '饰品商店' in obs.evidence:
             blue=cv2.inRange(hsv,(85,90,150),(120,255,255))
             obs.metrics['choice_confirm_ready']=int(count(blue,704,563,835,636)>600)

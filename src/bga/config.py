@@ -34,6 +34,8 @@ class Config:
     inspect_hand_cards: bool = False
     test_shop_spells: bool = False
     auto_sell_for_space: bool = False
+    auto_concede_on_error: bool = False
+    max_consecutive_recoveries: int = 3
     integration_seconds: int = 0
     resume_match_id: str = ''
 
@@ -54,6 +56,8 @@ class Config:
             raise ValueError('测试退出时间至少 5 秒')
         if self.auto_sell_for_space and not self.inspect_hand_cards:
             raise ValueError('自动腾位需要开启读取手牌说明')
+        if not isinstance(self.max_consecutive_recoveries,int) or isinstance(self.max_consecutive_recoveries,bool) or not 1<=self.max_consecutive_recoveries<=20:
+            raise ValueError('连续异常认输上限应为 1–20 局')
 
     @classmethod
     def load(cls, path: Path):

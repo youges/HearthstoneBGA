@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QFileDialog, QMessageBox
 import numpy as np
 
 from bga.gui import MainWindow,STYLE
+from bga.config import Config
 
 
 def test_gui_opens_all_pages_and_saves_calibration_without_input(tmp_path):
@@ -36,6 +37,20 @@ def test_gui_opens_all_pages_and_saves_calibration_without_input(tmp_path):
         window.finish_calibration()
         assert '尚需' in window.analysis_text.toPlainText()
         assert (tmp_path/'profiles'/'default.json').exists()
+    finally:
+        window.close();app.processEvents()
+
+
+def test_recovery_setting_and_limit_survive_save_and_reload(tmp_path):
+    app=QApplication.instance() or QApplication([])
+    window=MainWindow(tmp_path)
+    try:
+        assert not window.controls['auto_concede_on_error'].isChecked()
+        window.controls['auto_concede_on_error'].setChecked(True)
+        window.controls['max_consecutive_recoveries'].setValue(2)
+        window.save_settings()
+        saved=Config.load(tmp_path/'data/settings.json')
+        assert saved.auto_concede_on_error and saved.max_consecutive_recoveries==2
     finally:
         window.close();app.processEvents()
 

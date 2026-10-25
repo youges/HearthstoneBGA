@@ -30,6 +30,8 @@ def run_selftest():
         assert ctypes.sizeof(INPUT)==expected_size,'INPUT structure ABI mismatch'
         from .spell_qa import verify_multiple_spells
         report['multiple_targeted_spells']=verify_multiple_spells()
+        from .recovery_qa import verify_error_recovery
+        report['automatic_error_recovery']=verify_error_recovery(root)
         fontpath=Path(os.environ.get('BGA_TEST_FONT',str(Path(os.environ.get('WINDIR',r'C:\Windows'))/'Fonts'/'msyh.ttc')))
         font=ImageFont.truetype(str(fontpath),46)
         image=Image.new('RGB',(700,180),'white');draw=ImageDraw.Draw(image)

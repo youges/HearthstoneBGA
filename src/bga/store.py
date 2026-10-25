@@ -21,7 +21,10 @@ class Store:
             id TEXT PRIMARY KEY, started_at TEXT NOT NULL, ended_at TEXT,
             hero_slot INTEGER, end_reason TEXT NOT NULL, placement INTEGER,
             rating_before INTEGER, rating_after INTEGER, rating_delta INTEGER,
-            result_status TEXT NOT NULL, evidence_path TEXT)''')
+            result_status TEXT NOT NULL, evidence_path TEXT,
+            recovery_reason TEXT NOT NULL DEFAULT '')''')
+        if 'recovery_reason' not in {row[1] for row in self.db.execute('PRAGMA table_info(matches)')}:
+            self.db.execute("ALTER TABLE matches ADD COLUMN recovery_reason TEXT NOT NULL DEFAULT ''")
         self.db.commit()
 
     def save(self, match: Match):

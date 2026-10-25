@@ -9,7 +9,9 @@ from .store import now_iso
 
 
 class NeedsAttention(RuntimeError):
-    pass
+    def __init__(self,message,*,recoverable=False):
+        super().__init__(message)
+        self.recoverable=recoverable
 
 
 class Engine:
@@ -46,6 +48,9 @@ class Engine:
         self.probes_this_turn=0
         self.probe_cursor=0
         self.sold_for_space=False
+        self.recovery=None
+        self.recovery_streak=0
+        self.match_play_seen=False
 
     def reset_observation(self):
         self.board_unknown_since=None
@@ -60,9 +65,75 @@ class Engine:
         self.state_since = self.clock()
         self.last_action = None
         self.last_signature = None
+        if self.recovery and self.recovery['stage']!='failed':
+            self.recovery['started']=self.clock()
+
+    def begin_recovery(self,obs,error,window_kind='game'):
+        """Only explicitly recoverable engine failures may request concession."""
+        if (not self.config.auto_concede_on_error or self.config.observe_only or self.done
+                or not isinstance(error,NeedsAttention) or not error.recoverable
+                or self.recovery or not self.match or self.match.ended_at
+                or not self.match_play_seen or window_kind!='game'
+                or obs.state not in (State.RECRUIT,State.CHOICE,State.COMBAT,State.UNKNOWN)
+                or self.recovery_streak>=self.config.max_consecutive_recoveries
+                or not {'concede','confirm_concede'}<=obs.targets.keys()):
+            return False
+        self.recovery=dict(stage='open_menu',started=self.clock(),last_sent=-1000.0,
+                           escapes=0,concede_attempts=0,confirm_attempts=0)
+        self.match.recovery_reason=str(error)
+        self.store.save(self.match)
+        self.hand_probe=None
+        self.pending_hand_play=None
+        self.target_pending_since=None
+        self.last_action=None
+        self.log.emit('准备异常认输，等待确认菜单','WARNING',match_id=self.match.id,reason=str(error))
+        return True
+
+    def recovery_action(self,obs):
+        recovery=self.recovery
+        if recovery['stage']=='failed' or self.clock()-recovery['started']>90:
+            recovery['stage']='failed'
+            raise NeedsAttention('异常认输未能在 90 秒内完成，已暂停，请检查菜单或结算')
+        if obs.state in (State.MAIN,State.MODES,State.ENTRY,State.LAUNCHER,State.QUEUE,State.HERO):
+            recovery['stage']='failed'
+            raise NeedsAttention('异常恢复时已离开当前对局，已暂停核对记录')
+        if obs.state==State.MENU and obs.trusted and recovery['stage'] in ('open_menu','wait_confirm'):
+            if recovery['concede_attempts'] and self.clock()-recovery['last_sent']<8:return None
+            if not recovery['escapes']:
+                raise NeedsAttention('异常认输尚未请求菜单，已暂停')
+            if recovery['concede_attempts']>=3:
+                recovery['stage']='failed'
+                raise NeedsAttention('异常认输按钮连续无反馈，已暂停')
+            return self.action('click','异常恢复：点击认输',obs,'concede')
+        if obs.state==State.CONFIRM:
+            if not obs.trusted:return None
+            if recovery['stage'] not in ('wait_confirm','wait_result') or not self.concede_sent:
+                raise NeedsAttention('异常恢复中出现未预期的确认框，已暂停')
+            if recovery['confirm_attempts'] and self.clock()-recovery['last_sent']<8:return None
+            if recovery['confirm_attempts']>=3:
+                recovery['stage']='failed'
+                raise NeedsAttention('异常认输确认连续无反馈，已暂停')
+            return self.action('click','异常恢复：确认认输',obs,'confirm_concede')
+        if recovery['stage']=='open_menu':
+            if self.clock()-recovery['last_sent']<8:return None
+            if recovery['escapes']>=3:
+                recovery['stage']='failed'
+                raise NeedsAttention('异常恢复未能识别认输菜单，已暂停')
+            # Escape may first cancel a targeting arrow or hide a choice. No
+            # mouse click is permitted until a trusted menu has been observed.
+            return self.action('key','异常恢复：打开 Esc 菜单',obs,key='Escape')
+        return None
 
     def signature(self, obs):
         return (obs.state, tuple(sorted(obs.metrics.items())), tuple(obs.hand_minions), tuple(obs.shop_minions), obs.board_count)
+
+    def restore_concession(self):
+        if self.match and self.match.end_reason=='auto_recovery':
+            self.concede_sent=True
+            self.recovery_streak=1
+            self.match_play_seen=True
+            self.recovery=dict(stage='wait_confirm',started=self.clock(),last_sent=-1000.0,
+                               escapes=1,concede_attempts=1,confirm_attempts=0)
 
     def refresh_consumed_hand(self, obs):
         """Re-inspect shifted cards only after a verified cast has completed."""
@@ -173,6 +244,8 @@ class Engine:
                 self.match.result_status = 'attached_in_progress'
                 self.match.rating_before = None
             self.store.save(self.match)
+        if self.match and obs.state in (State.RECRUIT,State.CHOICE,State.COMBAT):
+            self.match_play_seen=True
         if obs.state == State.RESULT and self.match:
             self.result_frames += 1
             self.match.placement = self.confirmed_metrics.get('placement', self.match.placement)
@@ -190,13 +263,19 @@ class Engine:
                     self.match.result_status = ('complete' if self.match.placement is not None and self.match.rating_after is not None else 'partial')
                     self.store.save(self.match)
                     self.completed += 1
+                    recovered=self.match.end_reason=='auto_recovery'
                     self.log.emit(f'已完成 {self.completed} 局；名次 {self.match.placement}；分数 {self.match.rating_after}',match_id=self.match.id)
                     self.match = None
+                    self.recovery=None
+                    self.match_play_seen=False
+                    if not recovered:self.recovery_streak=0
                     self.concede_sent = False
                     self.hero_clicked = None
                     self.hero_attempts = self.result_frames = self.lobby_frames = 0
+                    if recovered and self.recovery_streak>=self.config.max_consecutive_recoveries:
+                        raise NeedsAttention(f'连续 {self.recovery_streak} 局异常认输，已暂停，请检查重复出现的问题')
             elif self.match:
-                if self.concede_sent and rating is not None:
+                if self.concede_sent and (rating is not None or self.stable>=max(4,self.config.stable_frames)):
                     self.match.ended_at=now_iso()
                     self.match.rating_after=rating
                     self.match.result_status='awaiting_lobby'
@@ -226,6 +305,12 @@ class Engine:
             return None
         if obs.state == State.AUTH:
             raise NeedsAttention('检测到账号认证，请用户手动处理')
+        if (self.recovery and self.clock()-self.recovery['started']>90
+                and not (obs.state==State.RESULT and obs.trusted and self.match and self.match.ended_at)):
+            self.recovery['stage']='failed'
+            raise NeedsAttention('异常认输未能在 90 秒内完成，已暂停，请检查菜单或结算')
+        if self.recovery and obs.state not in (State.RESULT,State.LOBBY,State.DISCONNECT,State.NOTICE):
+            return self.recovery_action(obs)
         if obs.state==State.UNKNOWN and self.hand_probe and self.hand_probe.get('stage')=='inspect':
             # A tooltip opened by our own hover can hide the tavern anchor.
             # Only move away here; any click/drag still needs a fresh trusted frame.
@@ -234,7 +319,7 @@ class Engine:
             return self.action('hover','收起遮挡识别区域的手牌说明',obs,'clear_tooltip')
         if not obs.trusted or obs.state == State.UNKNOWN:
             if self.clock() - self.state_since > self.config.state_timeout:
-                raise NeedsAttention('画面长期无法可靠识别，需要检查模板和窗口状态')
+                raise NeedsAttention('画面长期无法可靠识别，需要检查模板和窗口状态',recoverable=True)
             return None
         self.refresh_consumed_hand(obs)
         if obs.state==State.RECRUIT and obs.metrics.get('targeting_arrow')==1 and (
@@ -246,7 +331,7 @@ class Engine:
                     return self.action('click','选择已高亮的友方随从目标',obs,'friendly_target')
                 return None
             if self.clock()-self.last_action_time>=8:
-                raise NeedsAttention('指向性效果未完成目标选择，已暂停')
+                raise NeedsAttention('指向性效果未完成目标选择，已暂停',recoverable=True)
             return None
         if self.last_action and self.last_action.target=='hero_confirm' and obs.state==State.HERO:
             # Confirmation may leave the ready/waiting overlay up until all
@@ -260,7 +345,7 @@ class Engine:
             self.failures += 1
             self.last_action = None
             if self.failures >= 3:
-                raise NeedsAttention('连续操作后没有观察到预期变化，已暂停')
+                raise NeedsAttention('连续操作后没有观察到预期变化，已暂停',recoverable=True)
         elif self.last_action:
             self.log.emit('已观察到动作反馈',action=self.last_action.label)
             self.failures = 0
@@ -268,7 +353,7 @@ class Engine:
         mapping = {
             State.LAUNCHER: ('launcher_play','从战网启动炉石传说'),
             State.ENTRY: ('entry_continue','点击游戏入口'),
-            State.NOTICE: ('notice_close','关闭已识别的游戏公告'),
+            State.NOTICE: ('notice_close','关闭已识别的公告或任务弹窗'),
             State.MAIN: ('main_modes','打开模式入口'),
             State.MODES: ('mode_battlegrounds','进入酒馆战棋'),
             State.DISCONNECT: ('reconnect','尝试重新连接'),
@@ -312,6 +397,8 @@ class Engine:
         if obs.state == State.CHOICE:
             if obs.metrics.get('choice_confirm_ready')==1:
                 return self.action('click','确认已选择的局内选项',obs,'choice_confirm')
+            if obs.metrics.get('choice_kind')=='hero_power':
+                return self.action('click','选择英雄技能',obs,'choice_1')
             return self.action('click','处理已识别的发现选项',obs,'choice_1')
         if obs.state == State.RECRUIT:
             if self.target_pending_since is not None:
@@ -445,6 +532,23 @@ class Engine:
             return
         self.last_action, self.last_signature = action, self.signature(obs)
         self.before_action = obs
+        if self.recovery:
+            if action.kind=='key' and action.key=='Escape':
+                self.recovery['escapes']+=1
+                self.recovery['last_sent']=self.clock()
+            elif action.target=='concede':
+                self.recovery['concede_attempts']+=1
+                self.recovery['last_sent']=self.clock()
+                self.recovery['stage']='wait_confirm'
+                if not self.concede_sent:
+                    self.recovery_streak+=1
+                self.concede_sent=True
+                self.match.end_reason='auto_recovery'
+                self.store.save(self.match)
+            elif action.target=='confirm_concede':
+                self.recovery['confirm_attempts']+=1
+                self.recovery['last_sent']=self.clock()
+                self.recovery['stage']='wait_result'
         if action.target=='inspected_hand':
             self.hand_probe=None
             self.pending_hand_play={k:obs.metrics.get(k) for k in ('precast_hand_count','precast_hand_kind')}
@@ -468,7 +572,7 @@ class Engine:
             if self.match:
                 self.match.hero_slot = self.hero_clicked
                 self.store.save(self.match)
-        if action.source_state == State.MENU and action.target == 'concede' and self.match:
+        if action.source_state == State.MENU and action.target == 'concede' and self.match and not self.recovery:
             self.concede_sent=True
             self.match.end_reason = 'test_concede'
             self.store.save(self.match)

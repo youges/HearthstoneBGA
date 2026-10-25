@@ -334,11 +334,13 @@ class MainWindow(QMainWindow):
             ('inspect_hand_cards','读取手牌说明后区分随从与法术（测试功能）','check'),
             ('test_shop_spells','测试：每回合最多购买一张低费酒馆法术，读到明确效果后再用','check'),
             ('auto_sell_for_space','满场时为已识别手牌或可购买随从卖出腾位（最左，每回合最多一次）','check'),
+            ('auto_concede_on_error','局内连续操作失败或识别超时后，自动认输并重新匹配','check'),
             ('test_concede','测试模式：招募阶段到时主动认输','check'),
             ('poll_seconds','识别间隔（秒）','float',.3,30),
             ('action_seconds','动作最小间隔（秒）','float',.3,30),
             ('stable_frames','状态稳定帧数','int',2,10),
             ('state_timeout','未知 / 加载超时（秒）','float',15,1800),
+            ('max_consecutive_recoveries','连续异常认输上限（局）','int',1,20),
             ('max_matches','最多完成局数（0 为不限）','int',0,1000),
             ('preferred_hero','中间英雄偏好（2 或 3）','int',2,3),
             ('upgrade_max_cost','允许升级的最高费用','int',0,30),
@@ -354,14 +356,15 @@ class MainWindow(QMainWindow):
             section.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
             grid.addWidget(group,1+i//2,i%2,alignment=Qt.AlignmentFlag.AlignTop if i>=2 else Qt.AlignmentFlag(0));forms[title]=section
         categories={
-            '运行与窗口':['observe_only','auto_launch','focus_on_start','recover_focus','auto_adapt_resolution','max_matches','preferred_hero'],
+            '运行与窗口':['observe_only','auto_launch','focus_on_start','recover_focus','auto_adapt_resolution','auto_concede_on_error','max_matches','preferred_hero'],
             '购买与出牌':['inspect_hand_cards','test_shop_spells','auto_sell_for_space','upgrade_max_cost','min_gold_after_upgrade','max_actions_per_turn'],
-            '识别与等待':['poll_seconds','action_seconds','stable_frames','state_timeout'],
+            '识别与等待':['poll_seconds','action_seconds','stable_frames','state_timeout','max_consecutive_recoveries'],
             '测试选项':['test_concede','concede_after_seconds'],
         }
         short_labels={'observe_only':'只观察画面，不发送操作','auto_launch':'自动启动战网',
                       'focus_on_start':'启动时激活目标窗口','recover_focus':'失焦后自动恢复前台（空闲 2 秒）',
                       'auto_adapt_resolution':'自动适配分辨率与窗口比例',
+                      'auto_concede_on_error':'异常后自动认输并重开',
                       'inspect_hand_cards':'读取手牌，区分随从与法术',
                       'test_shop_spells':'测试购买低费酒馆法术','auto_sell_for_space':'满场自动卖出腾位（最左随从）',
                       'test_concede':'测试中主动认输'}
@@ -634,7 +637,7 @@ class MainWindow(QMainWindow):
             try:records=store.recent()
             finally:store.close()
             self.table.setRowCount(len(records))
-            reasons={'normal':'正常结束','test_concede':'测试主动认输','interrupted':'已中断'}
+            reasons={'normal':'正常结束','test_concede':'测试主动认输','interrupted':'已中断','auto_recovery':'异常自动认输'}
             statuses={'in_progress':'进行中','attached_in_progress':'中途接入','awaiting_lobby':'等待大厅分数','complete':'读取完整','replayed_complete':'截图补读完整','partial':'部分字段未知','interrupted':'未完成'}
             from datetime import datetime, timezone, timedelta
             for row,record in enumerate(records):
@@ -642,6 +645,7 @@ class MainWindow(QMainWindow):
                 values=[started,record['placement'],record['rating_after'],record['rating_delta'],reasons.get(record['end_reason'],record['end_reason']),statuses.get(record['result_status'],record['result_status']),record['hero_slot']]
                 for col,value in enumerate(values):
                     item=QTableWidgetItem('—' if value is None else str(value))
+                    if col==4 and record.get('recovery_reason'):item.setToolTip(record['recovery_reason'])
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                     self.table.setItem(row,col,item)
             if records:
