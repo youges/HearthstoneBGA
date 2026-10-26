@@ -9,6 +9,15 @@ def count(mask,x1,y1,x2,y2):
     return cv2.countNonZero(mask[y1:y2,x1:x2])
 
 
+def hand_card_mark(frame,point):
+    """Describe visible artwork at a candidate, independently of other cards."""
+    x,y=round(point[0]*1536),round(point[1]*864)
+    patch=frame[max(0,y-16):min(864,y+16),max(0,x-24):min(1536,x+24)]
+    if patch.shape[:2]!=(32,48) or max(patch.reshape(-1,3).std(axis=0))<5:return None
+    small=cv2.resize(cv2.GaussianBlur(patch,(5,5),0),(8,6),interpolation=cv2.INTER_AREA)
+    return tuple(int(n) for n in small.ravel())
+
+
 def hero_power_choice_point(image):
     """Locate a complete selectable power card under a verified choice title.
 
@@ -162,6 +171,14 @@ def targeting_arrow(frame):
 
 
 def highlighted_friendly_target(frame):
+    return _highlighted_minion_target(frame,408)
+
+
+def highlighted_shop_target(frame):
+    return _highlighted_minion_target(frame,252)
+
+
+def _highlighted_minion_target(frame,top):
     hsv=cv2.cvtColor(frame,cv2.COLOR_BGR2HSV)
     orange=cv2.inRange(hsv,(7,140,170),(35,255,255))
     ring=np.zeros((136,106),np.uint8)
@@ -171,10 +188,10 @@ def highlighted_friendly_target(frame):
         mask=np.zeros_like(ring);mask[region]=ring[region];masks.append(mask)
     best=(0,None)
     for x in range(380,1151,2):
-        roi=orange[408:544,x-53:x+53]
+        roi=orange[top:top+136,x-53:x+53]
         score=min(cv2.countNonZero(cv2.bitwise_and(roi,m))/cv2.countNonZero(m) for m in masks)
         if score>best[0]:best=(score,x)
-    return (best[1]/1536,476/864) if best[0]>.24 else None
+    return (best[1]/1536,(top+68)/864) if best[0]>.24 else None
 
 
 def apply_pc_layout(vision,image,obs):
@@ -212,9 +229,18 @@ def apply_pc_layout(vision,image,obs):
         obs.targets['friendly_target']=((768-(obs.board_count-1)*56)/1536,470/864)
     if obs.metrics['targeting_arrow']:
         target=highlighted_friendly_target(frame)
-        if target and not obs.board_count:
-            obs.targets['friendly_target']=target
+        if target:
+            if obs.board_count:
+                centers=[(768+(i-(obs.board_count-1)/2)*112)/1536 for i in range(obs.board_count)]
+                target=(min(centers,key=lambda x:abs(x-target[0])),470/864)
+            else:
+                obs.targets['friendly_target']=target
+            obs.targets['highlighted_friendly_target']=target
             obs.metrics['friendly_target_verified']=1
+        shop_target=highlighted_shop_target(frame)
+        if shop_target:
+            obs.targets['shop_spell_target']=shop_target
+            obs.metrics['shop_target_verified']=1
     tier_scores=[]
     for tier in range(1,7):
         name=f'pc_tier_{tier}'
@@ -257,6 +283,7 @@ def apply_pc_layout(vision,image,obs):
         if count(green,x-15,y-15,x+110,835)<180 or count(green,x,y-5,x+100,y+20)<40:
             continue
         name=f'hand_{i}';obs.targets[name]=((x+30)/1536,min(y+45,835)/864);obs.hand_minions.append(name)
+        obs.hand_priority.append(name)
     # Generated spells (e.g. Bananas) have no purple tavern-tier flag. Their
     # playable green card outline supplies a hover candidate, never a cast
     # authorization: the engine must still read the description first.
@@ -267,4 +294,7 @@ def apply_pc_layout(vision,image,obs):
         if any(abs(obs.targets[n][0]-point[0])<.035 for n in obs.hand_minions):continue
         name=f'hand_green_{i}';obs.targets[name]=point;obs.hand_minions.append(name)
     obs.hand_minions.sort(key=lambda name:obs.targets[name][0])
+    for name in obs.hand_minions:
+        mark=hand_card_mark(frame,obs.targets[name])
+        if mark is not None:obs.hand_marks[name]=mark
     obs.metrics['hand_count']=len(obs.hand_minions)

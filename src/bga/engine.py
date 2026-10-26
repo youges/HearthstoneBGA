@@ -4,7 +4,7 @@ import uuid
 import re
 
 from .config import Config
-from .model import Action, Match, Observation, State
+from .model import Action, Match, Observation, State, hand_marks_match, TARGETED_HAND_KINDS
 from .store import now_iso
 
 
@@ -144,9 +144,18 @@ class Engine:
             return
         old=pending.get('precast_hand_count')
         count=self.confirmed_metrics.get('hand_count')
-        if old is None or count is None or count>=old:
+        old_board=pending.get('precast_board_count')
+        acquired=(pending.get('precast_hand_kind')=='targeted_acquire'
+                  and obs.metrics.get('targeted_acquire_resolved')==1)
+        if pending.get('precast_hand_kind')=='targeted_acquire' and not acquired:return
+        minion_played=(pending.get('precast_hand_kind')=='minion' and old_board is not None
+                       and obs.board_count is not None and obs.board_count>old_board)
+        if not minion_played and not acquired and (old is None or count is None or count>=old):
             return
-        if pending.get('precast_hand_kind')=='buff':
+        if (not minion_played and pending.get('precast_hand_kind')=='minion' and pending.get('card_mark')
+                and any(hand_marks_match(pending['card_mark'],mark) for mark in obs.hand_marks.values())):
+            return
+        if pending.get('precast_hand_kind') in TARGETED_HAND_KINDS:
             self.target_pending_since=None
         self.pending_hand_play=None
         self.hand_probe=None
@@ -163,15 +172,22 @@ class Engine:
         if action.target == 'upgrade':
             old,new=before.metrics.get('tavern_tier'),after.metrics.get('tavern_tier')
             return old is not None and new is not None and new>old
-        if action.target == 'friendly_target':
+        if action.target in ('friendly_target','shop_spell_target'):
             return after.state==State.RECRUIT and after.metrics.get('targeting_arrow')==0
         if action.target=='sell_minion':
             old=before.metrics.get('gold');new=self.confirmed_metrics.get('gold')
             return (after.state==State.RECRUIT and before.board_count==7 and after.board_count==6
                     and old is not None and new is not None and new>=old+1)
         if action.target=='inspected_hand':
-            if before.metrics.get('precast_hand_kind')=='buff' and after.metrics.get('targeting_arrow')==1:
+            if before.metrics.get('precast_hand_kind')=='minion':
+                old_board=before.metrics.get('precast_board_count')
+                if old_board is not None and after.board_count is not None and after.board_count>old_board:return True
+                mark=before.hand_marks.get('inspected_hand')
+                if mark and any(hand_marks_match(mark,current) for current in after.hand_marks.values()):return False
+            if before.metrics.get('precast_hand_kind') in TARGETED_HAND_KINDS and after.metrics.get('targeting_arrow')==1:
                 return False
+            if before.metrics.get('precast_hand_kind')=='targeted_acquire':
+                return after.metrics.get('targeted_acquire_resolved')==1
             count=self.confirmed_metrics.get('hand_count')
             old=before.metrics.get('precast_hand_count')
             if before.metrics.get('precast_hand_kind')=='steal':
@@ -197,6 +213,18 @@ class Engine:
         return after.state != before.state
 
     def observe(self, obs: Observation):
+        pending=self.pending_hand_play
+        if pending and pending.get('precast_hand_kind')=='targeted_acquire':
+            mark=pending.get('card_mark')
+            gone=(mark is not None and bool(obs.hand_marks)
+                  and not any(hand_marks_match(mark,current) for current in obs.hand_marks.values()))
+            clear=(obs.state==State.RECRUIT and obs.trusted and obs.metrics.get('targeting_arrow')==0
+                   and (pending.get('target_clicked') or gone))
+            pending['clear_frames']=pending.get('clear_frames',0)+1 if clear else 0
+            if pending['clear_frames']>=2:obs.metrics['targeted_acquire_resolved']=1
+        if self.hand_probe and self.hand_probe.get('stage')=='ready' and self.hand_probe.get('mark') is not None:
+            matched=self.inspected_hand_candidate(obs) if obs.state==State.RECRUIT and obs.trusted else None
+            self.hand_probe['ready_frames']=self.hand_probe.get('ready_frames',0)+1 if matched else 0
         if obs.state == self.candidate:
             self.stable += 1
         else:
@@ -296,6 +324,15 @@ class Engine:
             raise NeedsAttention(f'缺少已校准的目标坐标：{destination}')
         return Action(kind,label,target,destination,key,obs.state,obs.captured_at)
 
+    def inspected_hand_candidate(self,obs):
+        probe=self.hand_probe
+        if not probe or probe.get('mark') is None:return None
+        px,py=probe['point']
+        candidates=[name for name in obs.hand_minions if abs(obs.targets[name][0]-px)<.025
+                    and abs(obs.targets[name][1]-py)<.025
+                    and hand_marks_match(probe['mark'],obs.hand_marks.get(name))]
+        return min(candidates,key=lambda n:abs(obs.targets[n][0]-px)+abs(obs.targets[n][1]-py)) if candidates else None
+
     def decide(self, obs: Observation):
         if self.config.observe_only or self.done:
             return None
@@ -322,13 +359,25 @@ class Engine:
                 raise NeedsAttention('画面长期无法可靠识别，需要检查模板和窗口状态',recoverable=True)
             return None
         self.refresh_consumed_hand(obs)
-        if obs.state==State.RECRUIT and obs.metrics.get('targeting_arrow')==1 and (
-            self.target_pending_since is not None or
-            self.pending_hand_play and self.pending_hand_play.get('precast_hand_kind')=='buff' or
-            re.search(r'选择一个|获得[+＋]',obs.evidence)):
-            if not self.last_action or self.last_action.target!='friendly_target':
-                if (obs.metrics.get('friendly_target_verified')==1 or obs.board_count) and 'friendly_target' in obs.targets:
+        if (obs.state==State.RECRUIT and self.pending_hand_play
+                and self.pending_hand_play.get('precast_hand_kind')=='targeted_acquire'
+                and obs.metrics.get('targeting_arrow')==0
+                and (self.pending_hand_play.get('target_clicked') or self.pending_hand_play.get('clear_frames',0)>0)):
+            return None
+        if obs.state==State.RECRUIT and obs.metrics.get('targeting_arrow')==1:
+            context=(self.target_pending_since is not None or
+                     self.pending_hand_play and self.pending_hand_play.get('precast_hand_kind') in TARGETED_HAND_KINDS or
+                     re.search(r'选择一个|获得[+＋]',obs.evidence))
+            if not context:return None
+            if not self.last_action or self.last_action.target not in ('friendly_target','shop_spell_target'):
+                acquire=self.pending_hand_play and self.pending_hand_play.get('precast_hand_kind')=='targeted_acquire'
+                if (obs.metrics.get('friendly_target_verified')==1 or obs.board_count and not acquire) and 'friendly_target' in obs.targets:
+                    if acquire and 'highlighted_friendly_target' in obs.targets:
+                        obs.targets['friendly_target']=obs.targets['highlighted_friendly_target']
                     return self.action('click','选择已高亮的友方随从目标',obs,'friendly_target')
+                if (self.pending_hand_play and self.pending_hand_play.get('precast_hand_kind')=='targeted_acquire'
+                        and obs.metrics.get('shop_target_verified')==1 and 'shop_spell_target' in obs.targets):
+                    return self.action('click','为主厨甄选选择已高亮的酒馆随从',obs,'shop_spell_target')
                 return None
             if self.clock()-self.last_action_time>=8:
                 raise NeedsAttention('指向性效果未完成目标选择，已暂停',recoverable=True)
@@ -450,14 +499,24 @@ class Engine:
                         spell_cost=self.confirmed_metrics.get(name+'_cost')
                         if present and spell_cost is None and self.clock()-self.hand_probe.get('ready_since',0)<4:
                             return None
-                        if (kind in ('buff','steal') or kind=='unknown' and spell_cost is not None and spell_cost<=3) and present and gold is not None and spell_cost is not None and gold>=spell_cost:
+                        if (kind in ('buff','steal','targeted_acquire') or kind=='unknown' and spell_cost is not None and spell_cost<=3) and present and gold is not None and spell_cost is not None and gold>=spell_cost:
                             obs.targets['inspected_shop_spell']=point
                             return self.action('drag','测试：购买一张法术用于手牌识别',obs,'inspected_shop_spell','hand_drop')
                         self.shop_spell_skipped.add(point);self.hand_probe=None
                         return None
-                    present=any(abs(obs.targets[n][0]-point[0])<.025 and abs(obs.targets[n][1]-point[1])<.025 for n in obs.hand_minions)
-                    if kind in ('coin','discover','buff','minion','steal') and present and len(obs.hand_minions)==self.hand_probe['count']:
+                    marked=self.hand_probe.get('mark') is not None
+                    candidate=self.inspected_hand_candidate(obs) if marked else None
+                    present=(candidate is not None if marked else
+                             any(abs(obs.targets[n][0]-point[0])<.025 and abs(obs.targets[n][1]-point[1])<.025 for n in obs.hand_minions))
+                    if marked and present and self.hand_probe.get('ready_frames',0)<2:
+                        return None
+                    if marked and not present and self.clock()-self.hand_probe.get('ready_since',0)<6:
+                        return None
+                    same_card=present and (self.hand_probe.get('ready_frames',0)>=2 if marked else len(obs.hand_minions)==self.hand_probe['count'])
+                    if kind in ('coin','discover','buff','minion','steal','targeted_acquire') and same_card:
+                        if marked:point=tuple(obs.targets[candidate])
                         obs.targets['inspected_hand']=point
+                        if marked:obs.hand_marks['inspected_hand']=obs.hand_marks[candidate]
                         if kind=='minion' and (obs.board_count is None or obs.board_count>=7):
                             if (self.config.auto_sell_for_space and obs.board_count==7 and not self.sold_for_space
                                     and gold is not None and 'tavernkeeper' in obs.targets and 'friendly_target' in obs.targets):
@@ -466,19 +525,35 @@ class Engine:
                             self.hand_skipped.add(point);self.hand_probe=None
                         elif kind=='buff' and (not obs.board_count or 'friendly_target' not in obs.targets):
                             self.hand_skipped.add(point);self.hand_probe=None
+                        elif kind=='targeted_acquire' and not (obs.board_count and 'friendly_target' in obs.targets or obs.shop_minions):
+                            self.hand_skipped.add(point);self.hand_probe=None
                         else:
-                            obs.metrics['precast_hand_count']=self.hand_probe['count']
+                            obs.metrics['precast_hand_count']=len(obs.hand_minions)
                             obs.metrics['precast_hand_kind']=kind
-                            destination='friendly_target' if kind=='buff' else 'board_drop'
+                            obs.metrics['precast_board_count']=obs.board_count
+                            if kind=='targeted_acquire':
+                                destination='friendly_target' if obs.board_count and 'friendly_target' in obs.targets else obs.shop_minions[0]
+                            else:
+                                destination='friendly_target' if kind=='buff' else 'board_drop'
                             return self.action('drag',f'使用已读说明的手牌：{kind}',obs,'inspected_hand',destination)
                     else:
-                        self.log.emit('未可靠读到手牌类型，本回合跳过该牌','WARNING',point=point)
+                        message='手牌图像或位置已变化，取消旧位置出牌' if marked and kind!='unknown' else '未可靠读到手牌类型，本回合跳过该牌'
+                        self.log.emit(message,'WARNING',point=point)
                         self.hand_skipped.add(point);self.hand_probe=None
                 names=obs.hand_minions
-                offset=self.probe_cursor%len(names) if names else 0
-                for name in names[offset:]+names[:offset]:
+                if obs.hand_marks:
+                    preferred=[n for n in obs.hand_priority if n in names]
+                    ordered=preferred+[n for n in names if n not in preferred]
+                    budget=max(3,min(10,len(names)))
+                else:
+                    offset=self.probe_cursor%len(names) if names else 0
+                    ordered=names[offset:]+names[:offset]
+                    budget=3
+                for name in ordered:
                     point=tuple(obs.targets[name])
-                    if point not in self.hand_skipped and self.probes_this_turn<3:
+                    skipped=(any(abs(point[0]-p[0])<.015 and abs(point[1]-p[1])<.015 for p in self.hand_skipped)
+                             if obs.hand_marks else point in self.hand_skipped)
+                    if not skipped and self.probes_this_turn<budget:
                         return self.action('hover','读取手牌说明',obs,name)
                 if self.config.test_shop_spells and not self.shop_spell_bought and obs.board_count and obs.board_count>=3:
                     for name in obs.shop_spells:
@@ -523,7 +598,8 @@ class Engine:
                 self.hand_probe['ready_since']=self.clock()
             else:
                 self.hand_probe={'point':tuple(obs.targets[action.target]),'since':self.clock(),'count':len(obs.hand_minions),'stage':'inspect',
-                                 'source':'shop' if action.target.startswith('spell_shop_') else 'hand','name':action.target}
+                                 'source':'shop' if action.target.startswith('spell_shop_') else 'hand','name':action.target,
+                                 'mark':obs.hand_marks.get(action.target),'ready_frames':0}
                 if not action.target.startswith('spell_shop_'):
                     self.probes_this_turn+=1
                     self.probe_cursor+=1
@@ -551,8 +627,9 @@ class Engine:
                 self.recovery['stage']='wait_result'
         if action.target=='inspected_hand':
             self.hand_probe=None
-            self.pending_hand_play={k:obs.metrics.get(k) for k in ('precast_hand_count','precast_hand_kind')}
-            if obs.metrics.get('precast_hand_kind')=='buff':
+            self.pending_hand_play={k:obs.metrics.get(k) for k in ('precast_hand_count','precast_hand_kind','precast_board_count')}
+            self.pending_hand_play['card_mark']=obs.hand_marks.get('inspected_hand')
+            if obs.metrics.get('precast_hand_kind') in TARGETED_HAND_KINDS:
                 self.target_pending_since=self.clock()
         if action.target=='inspected_shop_spell':
             self.hand_probe=None
@@ -561,7 +638,7 @@ class Engine:
             self.target_pending_since=self.clock() if obs.metrics.get('choice_targeted') else None
             if self.pending_hand_play and obs.metrics.get('choice_targeted'):
                 self.pending_hand_play['target_expected']=True
-        if action.target=='friendly_target':
+        if action.target in ('friendly_target','shop_spell_target'):
             self.target_pending_since=None
             if self.pending_hand_play:
                 self.pending_hand_play['target_clicked']=True

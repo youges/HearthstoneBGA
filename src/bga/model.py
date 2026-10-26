@@ -31,6 +31,12 @@ STATE_NAMES = dict(zip(State, [
 
 Point = tuple[float, float]
 Box = tuple[float, float, float, float]
+TARGETED_HAND_KINDS = frozenset(('buff','targeted_acquire'))
+
+
+def hand_marks_match(first,second):
+    if first is None or second is None or not len(first) or len(first)!=len(second):return False
+    return sum(abs(int(a)-int(b)) for a,b in zip(first,second))/len(first)<=12
 
 
 @dataclass
@@ -60,6 +66,8 @@ class Observation:
     tokens: list[Token] = field(default_factory=list)
     evidence: str = ''
     captured_at: float = field(default_factory=time.monotonic)
+    hand_marks: dict[str,tuple[int,...]] = field(default_factory=dict)
+    hand_priority: list[str] = field(default_factory=list)
 
 
 @dataclass

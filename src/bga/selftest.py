@@ -32,6 +32,10 @@ def run_selftest():
         report['multiple_targeted_spells']=verify_multiple_spells()
         from .recovery_qa import verify_error_recovery
         report['automatic_error_recovery']=verify_error_recovery(root)
+        from .hand_qa import verify_mixed_hand
+        report['mixed_hand']=verify_mixed_hand(root)
+        from .hand_qa import verify_chefs_choice
+        report['chefs_choice']=verify_chefs_choice(root)
         fontpath=Path(os.environ.get('BGA_TEST_FONT',str(Path(os.environ.get('WINDIR',r'C:\Windows'))/'Fonts'/'msyh.ttc')))
         font=ImageFont.truetype(str(fontpath),46)
         image=Image.new('RGB',(700,180),'white');draw=ImageDraw.Draw(image)

@@ -23,6 +23,12 @@ def run_replay(manifest,root=None):
         spec=json.loads(local(manifest).read_text(encoding='utf-8-sig'))
         vision=Vision(Profile.load(local(spec['profile_path'])),root)
         for case in spec['cases']:
+            point=case.get('inspect_point')
+            if point is not None and (len(point)!=2 or any(not isinstance(v,(int,float)) or not 0<v<1 for v in point)):
+                raise ValueError('回放手牌检查坐标非法')
+            vision.inspect_point=tuple(point) if point is not None else None
+            vision.inspect_source=case.get('inspect_source','hand')
+            if vision.inspect_source not in ('hand','shop'):raise ValueError('回放检查来源非法')
             frame=cv2.imdecode(np.fromfile(local(case['image']),dtype=np.uint8),cv2.IMREAD_COLOR)
             if frame is None:raise ValueError('无法读取回放图像')
             obs=vision.analyze(frame)

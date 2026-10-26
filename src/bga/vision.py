@@ -53,6 +53,11 @@ def classify_hand_text(tokens,min_type_y=.68):
     text=''.join(t.text.replace(' ','') for t in tokens)
     spell=any(t.text.strip() in ('酒馆','酒館','法术','酒馆法术') and t.center[1]>min_type_y for t in tokens)
     if spell:
+        # Chef's Choice selects a minion before gaining another of its type.
+        # It is not an untargeted Discover spell, even if another hand card
+        # happens to contain the word 发现.
+        acquire=re.search(r'选择一个随从.*(?:获取|获得)(?:相同类型|同类型|同一类型).*随从牌',text)
+        if acquire and not re.search(r'消灭|移除|敌方|失去|伤害',text):return 'targeted_acquire'
         if '附魔链索' in text or re.search(r'随机偷取酒[馆館]中的一[个個]随[从從]',text):return 'steal'
         if re.search(r'获得[一二三四五六七八九十\d]+(?:枚)?(?:铸币|金币)',text) and not re.search(r'消灭|移除|失去|伤害|随从',text):return 'coin'
         direct_buff=re.search(r'使一个(?:友方)?随从(?:获得|的)',text)
@@ -204,6 +209,10 @@ class Vision:
             if labels:
                 label=max(labels,key=lambda t:t.box[3])
                 tokens=[t for t in tokens if abs(t.center[0]-label.center[0])<.095]
+                if self.inspect_source=='hand' and label.box[3]>=.02:
+                    # The enlarged type bar ends this card. Smaller cards below
+                    # it can advertise unrelated Discover/buff effects.
+                    tokens=[t for t in tokens if t.center[1]<=label.center[1]+max(.015,label.box[3]*.8)]
             kind=classify_hand_text(tokens,.35 if self.inspect_source=='shop' else .68)
             if kind=='unknown' and self.inspect_source=='hand' and hasattr(self.ocr,'recognize_line'):
                 # The enlarged hand card's footer can sit against the bottom

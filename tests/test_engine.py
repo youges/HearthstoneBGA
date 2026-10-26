@@ -156,7 +156,7 @@ def test_arrow_without_choice_context_never_authorizes_friendly_click(world,targ
     obs=Observation(State.RECRUIT,.99,True,targets,metrics={'targeting_arrow':1,'gold':10},
                     board_count=2,hand_minions=['hand_1'],shop_minions=['shop_1'])
     settle(engine,clock,obs)
-    assert engine.decide(obs).target!='friendly_target'
+    assert engine.decide(obs) is None
 
 
 def test_trinket_selection_needs_confirm(world,targets):
