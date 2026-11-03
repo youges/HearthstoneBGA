@@ -53,18 +53,24 @@ def classify_hand_text(tokens,min_type_y=.68):
     text=''.join(t.text.replace(' ','') for t in tokens)
     spell=any(t.text.strip() in ('酒馆','酒館','法术','酒馆法术') and t.center[1]>min_type_y for t in tokens)
     if spell:
+        if any(t.text.strip() in ('香蕉','大香蕉') for t in tokens):return 'buff'
+        # User policy: random takes precedence over Discover; global friendly
+        # effects likewise cast without selecting an individual minion.
+        if '附魔链索' in text or re.search(r'随机偷取酒[馆館]中的一[个個]随[从從]',text):return 'steal'
+        if '随机' in text or '使你的随从' in text:return 'untargeted'
+        if '发现' in text:return 'discover'
         # Chef's Choice selects a minion before gaining another of its type.
         # It is not an untargeted Discover spell, even if another hand card
         # happens to contain the word 发现.
         acquire=re.search(r'选择一个随从.*(?:获取|获得)(?:相同类型|同类型|同一类型).*随从牌',text)
         if acquire and not re.search(r'消灭|移除|敌方|失去|伤害',text):return 'targeted_acquire'
-        if '附魔链索' in text or re.search(r'随机偷取酒[馆館]中的一[个個]随[从從]',text):return 'steal'
         if re.search(r'获得[一二三四五六七八九十\d]+(?:枚)?(?:铸币|金币)',text) and not re.search(r'消灭|移除|失去|伤害|随从',text):return 'coin'
         direct_buff=re.search(r'使一个(?:友方)?随从(?:获得|的)',text)
         tribe_buff=re.search(r'选择一个随从.*酒[馆館].*类型.*获得',text)
         if (direct_buff or tribe_buff) and not re.search(r'消灭|移除|敌方|失去|伤害',text):return 'buff'
-        if '发现' in text or re.search(r'随机获取.*随从|获取一张.*随从牌',text):return 'discover'
-        return 'unknown'
+        # A visible spell footer is still required. Unread/unsupported spell
+        # effects follow the user's no-target fallback, never the minion path.
+        return 'untargeted'
     if any(t.text.strip() in ('随从','野猪人','机械','野兽','恶魔','鱼人','海盗','龙','元素','纳迦','亡灵','畸变怪','全部') and t.center[1]>.68 for t in tokens):
         return 'minion'
     stats=[t for t in tokens if t.center[1]>.68 and re.fullmatch(r'\d{1,3}',t.text.strip())]

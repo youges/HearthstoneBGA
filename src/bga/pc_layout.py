@@ -18,6 +18,39 @@ def hand_card_mark(frame,point):
     return tuple(int(n) for n in small.ravel())
 
 
+def overlapping_spell_candidates(vision,frame,green):
+    """Read mana crests on joined hand outlines; these authorize hover only.
+
+    Several Bananas form one component wider than an individual card. A local
+    enlarged OCR pass supplies separate candidates without treating that whole
+    component as a card or guessing evenly spaced hand slots.
+    """
+    _,_,stats,_=cv2.connectedComponentsWithStats(green[730:835,400:1100])
+    joined=[(x,y,w,h) for x,y,w,h,area in stats[1:]
+            if w>145 and h>=40 and area>=600 and y<65]
+    if not joined or vision.inspect_point:return []
+    # Only run the extra OCR over a joined, playable outline, away from HUD
+    # gold and hero health. A hovering tooltip must not supply new candidates.
+    roi=frame[730:864,470:1000]
+    tokens=vision.ocr.tokens(cv2.resize(roi,None,fx=2,fy=2,interpolation=cv2.INTER_LINEAR))
+    crests=[t for t in tokens if t.score>=.90 and re.fullmatch(r'\d{1,2}',t.text.strip())]
+    if len(crests)<min(3,max(2,round(max(w for x,y,w,h in joined)/100))):
+        tokens+=vision.ocr.tokens(cv2.resize(roi,None,fx=3,fy=3,interpolation=cv2.INTER_LINEAR))
+    points=[]
+    for token in tokens:
+        if token.score<.80 or not re.fullmatch(r'\d{1,2}',token.text.strip()):continue
+        x=470+token.center[0]*530;y=730+token.center[1]*134
+        if token.box[3]*134<12 or y>800:continue
+        # The cost crest sits on the top-left corner, adjacent to its own
+        # playable glow. Text in the card's effect box is not a mana crest.
+        if not any(400+left-20<=x<=400+left+w+40 and 730+top-5<=y<=730+top+65
+                   for left,top,w,h in joined):continue
+        if count(green,round(x)-18,round(y)-24,round(x)+35,round(y)+35)<100:continue
+        point=((x+30)/1536,min(y+30,835)/864)
+        if not any(abs(point[0]-p[0])<.035 for p in points):points.append(point)
+    return points
+
+
 def hero_power_choice_point(image):
     """Locate a complete selectable power card under a verified choice title.
 
@@ -293,6 +326,9 @@ def apply_pc_layout(vision,image,obs):
         point=((400+x+w/2)/1536,min(730+y+50,835)/864)
         if any(abs(obs.targets[n][0]-point[0])<.035 for n in obs.hand_minions):continue
         name=f'hand_green_{i}';obs.targets[name]=point;obs.hand_minions.append(name)
+    for i,point in enumerate(overlapping_spell_candidates(vision,frame,green),1):
+        if any(abs(obs.targets[n][0]-point[0])<.035 for n in obs.hand_minions):continue
+        name=f'hand_joined_{i}';obs.targets[name]=point;obs.hand_minions.append(name)
     obs.hand_minions.sort(key=lambda name:obs.targets[name][0])
     for name in obs.hand_minions:
         mark=hand_card_mark(frame,obs.targets[name])

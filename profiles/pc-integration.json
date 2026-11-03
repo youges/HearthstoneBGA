@@ -595,7 +595,23 @@
         1536,
         864
       ],
-      "threshold": 0.8
+      "threshold": 0.8,
+      "alternatives": [
+        {
+          "file": "assets/templates/live/recruit-refresh-control.png",
+          "box": [
+            0.5657552083333334,
+            0.16550925925925927,
+            0.041015625,
+            0.06597222222222222
+          ],
+          "frame_size": [
+            1536,
+            864
+          ],
+          "threshold": 0.96
+        }
+      ]
     },
     "combat": {
       "file": "assets/templates/live/combat.png",

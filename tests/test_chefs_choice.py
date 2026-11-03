@@ -17,9 +17,9 @@ ROOT=Path(__file__).resolve().parents[1]
 @pytest.mark.parametrize('description,expected',[
     ('选择一个随从。获取相同类型的另一张随从牌。','targeted_acquire'),
     ('选择一个随从。获得同类型的另一张随从牌。','targeted_acquire'),
-    ('主厨甄选，文字未读取完整','unknown'),
-    ('选择一个随从。消灭它，获取相同类型的另一张随从牌。','unknown'),
-    ('选择一个敌方随从。获取相同类型的另一张随从牌。','unknown'),
+    ('主厨甄选，文字未读取完整','untargeted'),
+    ('选择一个随从。消灭它，获取相同类型的另一张随从牌。','untargeted'),
+    ('选择一个敌方随从。获取相同类型的另一张随从牌。','untargeted'),
     ('发现一个随从。','discover'),
     ('使一个随从获得+3/+3。','buff'),
 ])
@@ -133,7 +133,7 @@ def test_smaller_card_below_selected_footer_cannot_supply_discover_text():
     obs=Observation(State.RECRUIT,tokens=[Token('未知效果文字',.99,(.33,.8,.15,.06)),
         Token('酒馆',.99,(.38,.92,.05,.03)),Token('发动（2）：发现一张随从牌',.99,(.42,.976,.12,.015))])
     v.inspect_context(obs,np.zeros((1080,1920,3),np.uint8))
-    assert obs.metrics['hand_card_kind']=='unknown'
+    assert obs.metrics['hand_card_kind']=='untargeted'
 
 
 def incident(name):
