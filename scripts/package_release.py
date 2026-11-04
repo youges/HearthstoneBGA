@@ -96,6 +96,8 @@ def main():
         checks.append(dict(name=flag,passed=True))
         shutil.copy2(path,ROOT/'data'/('public-package-'+artifact))
         path.unlink()
+        if flag=='--smoke-test':
+            (app/'data/gui-settings-preview.png').unlink(missing_ok=True)
     assert sorted(p.name for p in (app/'data').iterdir())==['settings.json']
     source=staging/'HearthstoneBGA-source';source.mkdir()
     shutil.copytree(ROOT/'src',source/'src',ignore=shutil.ignore_patterns('__pycache__','*.pyc'))

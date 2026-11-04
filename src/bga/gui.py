@@ -7,12 +7,12 @@ import time
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QTimer, QThread
+from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QTimer, QThread, QTime
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QGridLayout, QGroupBox, QTabWidget, QLineEdit, QCheckBox, QSpinBox, QDoubleSpinBox,
-    QComboBox, QFormLayout, QPlainTextEdit, QTableWidget, QTableWidgetItem, QHeaderView,
+    QComboBox, QFormLayout, QPlainTextEdit, QTableWidget, QTableWidgetItem, QHeaderView, QTimeEdit,
     QFileDialog, QMessageBox, QSplitter, QScrollArea, QFrame, QAbstractItemView,
 )
 
@@ -212,6 +212,8 @@ class MainWindow(QMainWindow):
         self.pending_selection=None
         self.config_path=Path(config_path) if config_path else self.root/'data'/'settings.json'
         self.startup_error=''
+        self.schedule_armed = False
+        self.closing = False
         try:
             self.config=Config.load(self.config_path)
             self.profile=Profile.load(self.root/self.config.profile_path)
@@ -246,6 +248,10 @@ class MainWindow(QMainWindow):
         self.timer=QTimer(self);self.timer.timeout.connect(self.refresh_history);self.timer.start(2500)
         if self.startup_error:
             self.log.appendPlainText(self.startup_error)
+        self.schedule_armed = self.config.schedule_enabled and not self.startup_error
+        self.schedule_timer=QTimer(self)
+        self.schedule_timer.timeout.connect(self.schedule_tick)
+        self.schedule_timer.start(1000)
 
     def build_run_page(self):
         page=QWidget();self.tabs.addTab(page,'运行概览')
@@ -326,6 +332,8 @@ class MainWindow(QMainWindow):
         self.path_hint=QLabel();self.path_hint.setObjectName('subtitle');form.addRow('',self.path_hint)
         self.detect_launcher()
         entries=[
+            ('close_after_matches','达到固定局数后自动关闭助手','check'),
+            ('schedule_enabled','按自定义时间段自动启动和关闭（优先于局数）','check'),
             ('observe_only','只观察画面，不发送鼠标键盘输入','check'),
             ('auto_launch','未运行时自动启动战网','check'),
             ('focus_on_start','运行时激活战网 / 游戏窗口','check'),
@@ -356,7 +364,7 @@ class MainWindow(QMainWindow):
             section.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
             grid.addWidget(group,1+i//2,i%2,alignment=Qt.AlignmentFlag.AlignTop if i>=2 else Qt.AlignmentFlag(0));forms[title]=section
         categories={
-            '运行与窗口':['observe_only','auto_launch','focus_on_start','recover_focus','auto_adapt_resolution','auto_concede_on_error','max_matches','preferred_hero'],
+            '运行与窗口':['observe_only','auto_launch','focus_on_start','recover_focus','auto_adapt_resolution','auto_concede_on_error','max_matches','preferred_hero','close_after_matches','schedule_enabled'],
             '购买与出牌':['inspect_hand_cards','test_shop_spells','auto_sell_for_space','upgrade_max_cost','min_gold_after_upgrade','max_actions_per_turn'],
             '识别与等待':['poll_seconds','action_seconds','stable_frames','state_timeout','max_consecutive_recoveries'],
             '测试选项':['test_concede','concede_after_seconds'],
@@ -379,6 +387,12 @@ class MainWindow(QMainWindow):
                 widget.setMaximumWidth(140);widget.setAlignment(Qt.AlignmentFlag.AlignRight)
                 form.addRow(label,widget)
             self.controls[key]=widget
+        for key,label in [('schedule_start','每天开始时间'),('schedule_end','每天结束时间')]:
+            widget=QTimeEdit(QTime.fromString(getattr(self.config,key),'HH:mm'))
+            widget.setDisplayFormat('HH:mm'); forms['运行与窗口'].addRow(label,widget)
+            self.controls[key]=widget
+        hint=QLabel('同时勾选时按时间段运行，忽略局数。支持跨午夜。\n保存后自动等待开始时间；到结束时间立即停止并关闭助手。\n电脑需开机并已登录；未勾选时间段时，局数上限仍可单独停止运行。')
+        hint.setWordWrap(True);forms['运行与窗口'].addRow(hint)
         for section in forms.values():
             for row in range(section.rowCount()):
                 item=section.itemAt(row,QFormLayout.ItemRole.LabelRole)
@@ -555,16 +569,51 @@ class MainWindow(QMainWindow):
     def read_settings(self):
         values=asdict(self.config);values['battle_net_path']=self.path_edit.text().strip()
         for key,control in self.controls.items():
+            if isinstance(control,QTimeEdit):
+                values[key]=control.time().toString('HH:mm');continue
             values[key]=control.isChecked() if isinstance(control,QCheckBox) else control.value()
         config=Config(**values);config.validate();return config
 
     def save_settings(self):
         try:
-            self.config=self.read_settings();self.config.save(self.config_path)
+            self.persist_settings(self.read_settings())
+            self.schedule_armed=self.config.schedule_enabled
             self.mode_label.setText('只观察画面' if self.config.observe_only else '真实鼠标键盘操作')
             self.log.appendPlainText('设置已保存')
         except Exception as e:
             QMessageBox.warning(self,'设置未保存',str(e))
+
+    def persist_settings(self, config):
+        from .schedule import sync_task
+        previous=self.config
+        changed=any(getattr(previous,k)!=getattr(config,k) for k in
+                    ('schedule_enabled','schedule_start','schedule_end'))
+        config.save(self.config_path)
+        try:
+            if changed: sync_task(config,self.root)
+        except Exception:
+            previous.save(self.config_path)
+            try: sync_task(previous,self.root)
+            except Exception: pass
+            raise
+        self.config=config
+
+    def schedule_tick(self):
+        from datetime import datetime
+        from .schedule import window
+        if self.closing:return
+        if self.worker and self.worker.isRunning():
+            deadline=getattr(self.worker,'schedule_deadline',None)
+            if deadline and datetime.now()>=deadline:
+                self.worker.end_reason='schedule_end';self.worker.stop()
+            return
+        if self.schedule_armed and self.config.schedule_enabled:
+            begin,end=window(self.config)
+            if datetime.now()>=begin:
+                self.schedule_armed=False;self.start_run()
+            else:
+                self.set_running(True)
+                self.state_label.setText('等待定时启动：'+begin.strftime('%m-%d %H:%M'))
 
     def browse_exe(self):
         filename,_=QFileDialog.getOpenFileName(self,'选择战网启动程序',self.path_edit.text(),'程序 (*.exe)')
@@ -594,8 +643,18 @@ class MainWindow(QMainWindow):
             profile=Profile.load(self.root/config.profile_path)
             if not config.observe_only and (not profile.calibrated or profile.missing()):
                 raise ValueError('当前布局未完成校准，请先完成校准并验证识别')
-            config.save(self.config_path);self.config=config
+            self.persist_settings(config)
+            if config.schedule_enabled:
+                from datetime import datetime
+                from .schedule import window
+                begin,end=window(config)
+                if datetime.now()<begin:
+                    self.schedule_armed=True
+                    self.set_running(True);self.schedule_tick();return
+            self.schedule_armed=False
             self.worker=Runner(config,self.root)
+            if config.schedule_enabled:
+                self.worker.schedule_deadline=end
             self.worker.message.connect(self.log.appendPlainText)
             self.worker.status.connect(self.state_label.setText)
             self.worker.preview.connect(self.preview.set_frame)
@@ -612,6 +671,9 @@ class MainWindow(QMainWindow):
 
     def run_finished(self):
         self.set_running(False)
+        reason=getattr(self.worker,'end_reason','')
+        if reason=='schedule_end' or (reason=='match_limit' and self.config.close_after_matches and not self.config.schedule_enabled):
+            self.close();return
         if not self.state_label.text().startswith('运行失败'):
             self.state_label.setText('本次运行已结束')
         self.showNormal()
@@ -624,7 +686,10 @@ class MainWindow(QMainWindow):
             self.worker.resume();self.showMinimized()
 
     def stop_run(self):
-        if self.worker:self.worker.stop()
+        self.schedule_armed=False
+        if self.worker and self.worker.isRunning():self.worker.stop()
+        else:
+            self.set_running(False);self.state_label.setText('已取消本次定时等待')
 
     def on_observation(self,obs):
         self.count_label.setText(f'{obs["completed"]} 局')
@@ -666,6 +731,8 @@ class MainWindow(QMainWindow):
         finally:store.close()
 
     def closeEvent(self,event):
+        self.closing=True
+        self.schedule_timer.stop()
         self.capture_timer.stop()
         # Wait without killing the thread or leaving a pressed mouse button.
         if self.worker and self.worker.isRunning():
@@ -694,6 +761,33 @@ def main():
         if not test_path.is_relative_to(project_root().resolve()):
             raise ValueError('测试配置必须位于项目内')
     window=MainWindow(config_path=test_path);window.show()
+    # Scheduled launches reuse the existing desktop window and worker.
+    if test_path is None and '--smoke-test' not in sys.argv:
+        from PySide6.QtNetwork import QLocalServer, QLocalSocket
+        from .schedule import task_name
+        name=task_name(window.root)
+        socket=QLocalSocket();socket.connectToServer(name)
+        if socket.waitForConnected(300):
+            socket.write(b'schedule' if '--scheduled-run' in sys.argv else b'show')
+            socket.waitForBytesWritten(500);socket.disconnectFromServer()
+            window.close();return 0
+        server=QLocalServer(app)
+        if not server.listen(name):
+            QLocalServer.removeServer(name)
+            if not server.listen(name):raise RuntimeError('无法建立助手单实例通道')
+        def connected():
+            peer=server.nextPendingConnection()
+            def receive():
+                data=bytes(peer.readAll())
+                if data==b'schedule':
+                    window.schedule_armed=window.config.schedule_enabled;window.schedule_tick()
+                else:window.showNormal();window.raise_()
+                peer.disconnectFromServer();peer.deleteLater()
+            peer.readyRead.connect(receive)
+            if peer.bytesAvailable():receive()
+        server.newConnection.connect(connected)
+    if '--scheduled-run' in sys.argv and not window.config.schedule_enabled:
+        window.close();return 0
     if test_path:
         def start_test():
             window.start_run()
@@ -703,6 +797,10 @@ def main():
     if '--smoke-test' in sys.argv:
         def save_preview():
             path=window.root/'data'/'gui-preview.png';path.parent.mkdir(parents=True,exist_ok=True)
-            window.grab().save(str(path));window.close();app.quit()
+            window.grab().save(str(path))
+            window.tabs.setCurrentIndex(2)
+            app.processEvents()
+            window.grab().save(str(path.with_name('gui-settings-preview.png')))
+            window.close();app.quit()
         QTimer.singleShot(600,save_preview)
     return app.exec()

@@ -358,7 +358,7 @@ class Engine:
                     raise NeedsAttention('未观察到结算就返回大厅，当前场需检查，已停止自动开始')
             if rating is not None:
                 self.last_rating = rating
-            if self.config.max_matches and self.completed >= self.config.max_matches:
+            if not self.config.schedule_enabled and self.config.max_matches and self.completed >= self.config.max_matches:
                 self.done = True
         return True
 

@@ -30,6 +30,8 @@ class Runner(QThread):
         self.reset_requested = threading.Event()
         self.vision = None
         self.engine = None
+        self.end_reason = ''
+        self.schedule_deadline = None
 
     def stop(self):
         self.stop_event.set()
@@ -65,6 +67,17 @@ class Runner(QThread):
         geometry_reported=None
         try:
             self.config.validate()
+            if self.config.schedule_enabled:
+                from datetime import datetime
+                from .schedule import window
+                if self.schedule_deadline is None:
+                    begin, end = window(self.config)
+                    if datetime.now() < begin:
+                        raise ValueError('当前不在设定运行时间段内')
+                    self.schedule_deadline = end
+                if datetime.now() >= self.schedule_deadline:
+                    self.end_reason = 'schedule_end'
+                    return
             profile_path = (self.root/self.config.profile_path).resolve()
             if not profile_path.is_relative_to(self.root.resolve()):
                 raise ValueError('校准文件必须位于项目目录中')
@@ -106,6 +119,12 @@ class Runner(QThread):
             last_reported = None
             f8_down = False
             while not self.stop_event.is_set():
+                if self.schedule_deadline is not None:
+                    from datetime import datetime
+                    if datetime.now() >= self.schedule_deadline:
+                        self.end_reason = 'schedule_end'
+                        log.emit('运行时间段已结束，停止并关闭助手')
+                        break
                 if self.config.integration_seconds and time.monotonic()-started>=self.config.integration_seconds:
                     log.emit('达到整体测试时长，停止本次程序运行')
                     break
@@ -217,6 +236,7 @@ class Runner(QThread):
                                  confidence=obs.confidence,evidence_path=self.engine.match.evidence_path)
                     self.records_changed.emit()
                     if self.engine.done:
+                        self.end_reason = 'match_limit'
                         log.emit('达到配置局数，已停止')
                         break
                     if ready:

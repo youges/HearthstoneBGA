@@ -20,6 +20,8 @@ for flag,artifact in [('--smoke-test','gui-preview.png'),('--self-test','runtime
     assert path.is_file()
     if path.suffix=='.json':assert json.loads(path.read_text(encoding='utf-8'))['passed']
     path.unlink()
+    if flag=='--smoke-test':
+        (app/'data/gui-settings-preview.png').unlink(missing_ok=True)
 assert sorted(p.name for p in (app/'data').iterdir())==['settings.json']
 settings=json.loads((app/'data/settings.json').read_text(encoding='utf-8'))
 assert settings['observe_only'] and settings['auto_adapt_resolution'] and not settings['battle_net_path']

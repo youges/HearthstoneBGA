@@ -21,6 +21,10 @@ class Config:
     stable_frames: int = 2
     state_timeout: float = 240.0
     max_matches: int = 0
+    close_after_matches: bool = False
+    schedule_enabled: bool = False
+    schedule_start: str = '08:00'
+    schedule_end: str = '15:00'
     preferred_hero: int = 2
     upgrade_max_cost: int = 30
     min_gold_after_upgrade: int = 3
@@ -40,6 +44,16 @@ class Config:
     resume_match_id: str = ''
 
     def validate(self):
+        from datetime import datetime
+        for value in (self.schedule_start, self.schedule_end):
+            if not isinstance(value,str) or len(value)!=5:
+                raise ValueError('运行时间应为 HH:MM')
+            try: datetime.strptime(value, '%H:%M')
+            except ValueError: raise ValueError('运行时间应为 HH:MM') from None
+        if self.schedule_enabled and self.schedule_start == self.schedule_end:
+            raise ValueError('开始和结束时间不能相同')
+        if self.close_after_matches and not self.schedule_enabled and self.max_matches < 1:
+            raise ValueError('按固定局数关闭时，局数至少为 1')
         if self.preferred_hero not in (2, 3):
             raise ValueError('英雄偏好只能为 2 或 3')
         if not 0.3 <= self.poll_seconds <= 30:
