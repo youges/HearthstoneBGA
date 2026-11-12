@@ -1,5 +1,6 @@
 from pathlib import Path
 import cv2
+import numpy as np
 import pytest
 from bga.pc_layout import board_count,count_tavern_stars,highlighted_friendly_target,targeting_arrow
 from bga.config import Profile
@@ -35,6 +36,23 @@ def test_shielded_golden_minion_still_counts_when_row_geometry_is_clear(name):
     image=cv2.resize(frame(name),(1536,864),interpolation=cv2.INTER_AREA)
     empty=cv2.resize(cv2.imread(str(ROOT/'assets/templates/live/empty-board-frame.png')),(1536,864))
     assert board_count(image,empty)==4
+
+
+def test_two_clear_slots_win_over_center_glow_but_not_a_choice_overlay():
+    empty=np.zeros((864,1536,3),dtype=np.uint8)
+    image=empty.copy()
+    for x in (712,824):
+        image[425:525,x-32:x+32]=150
+    image[425:463,744:792]=150
+    assert board_count(image,empty)==2
+    image[550:560,500:520]=(255,0,0)
+    assert board_count(image,empty) is None
+
+
+def test_live_two_minions_with_glow_still_show_free_slots():
+    image=cv2.resize(frame('20261105-board-two-with-glow'),(1536,864),interpolation=cv2.INTER_AREA)
+    empty=cv2.resize(cv2.imread(str(ROOT/'assets/templates/live/empty-board-frame.png')),(1536,864))
+    assert board_count(image,empty)==2
 
 
 class NoOCR:

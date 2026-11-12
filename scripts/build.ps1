@@ -27,7 +27,7 @@ try {
     # out of PyInstaller's DLL search. This modifies only this build process.
     $env:PATH = @("$projectRoot\.venv\Scripts", "$buildPythonBase", "$env:WINDIR\System32", "$env:WINDIR", "$env:WINDIR\System32\Wbem") -join ';'
     $env:PYINSTALLER_CONFIG_DIR = Join-Path $projectRoot 'build\pyinstaller-cache'
-    & "$projectRoot\.venv\Scripts\python.exe" -m PyInstaller --clean --noconfirm --windowed --onedir --name HearthstoneBGA --paths src --distpath "$projectRoot\dist" --workpath "$projectRoot\build" --collect-all rapidocr --collect-all onnxruntime --hidden-import mss.windows run.py
+    & "$projectRoot\.venv\Scripts\python.exe" -m PyInstaller --clean --noconfirm --windowed --onedir --name HearthstoneBGA --icon "$projectRoot\assets\ui\app-icon.ico" --paths src --distpath "$projectRoot\dist" --workpath "$projectRoot\build" --collect-all rapidocr --collect-all onnxruntime --hidden-import mss.windows run.py
     if ($LASTEXITCODE -ne 0) { throw 'PyInstaller build failed' }
 } finally {
     $env:PATH = $buildPreviousPath

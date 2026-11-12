@@ -25,6 +25,9 @@ class Config:
     schedule_enabled: bool = False
     schedule_start: str = '08:00'
     schedule_end: str = '15:00'
+    schedule_weekdays: list[int] = field(default_factory=lambda: list(range(7)))
+    schedule_mode: str = 'weekdays'
+    schedule_dates: list[str] = field(default_factory=list)
     preferred_hero: int = 2
     upgrade_max_cost: int = 30
     min_gold_after_upgrade: int = 3
@@ -44,7 +47,7 @@ class Config:
     resume_match_id: str = ''
 
     def validate(self):
-        from datetime import datetime
+        from datetime import date, datetime
         for value in (self.schedule_start, self.schedule_end):
             if not isinstance(value,str) or len(value)!=5:
                 raise ValueError('运行时间应为 HH:MM')
@@ -52,6 +55,26 @@ class Config:
             except ValueError: raise ValueError('运行时间应为 HH:MM') from None
         if self.schedule_enabled and self.schedule_start == self.schedule_end:
             raise ValueError('开始和结束时间不能相同')
+        if (not isinstance(self.schedule_weekdays,list)
+                or any(type(day) is not int or not 0<=day<=6 for day in self.schedule_weekdays)
+                or len(set(self.schedule_weekdays))!=len(self.schedule_weekdays)):
+            raise ValueError('运行日期应为周一至周日，且不能重复')
+        if self.schedule_mode not in ('weekdays','dates'):
+            raise ValueError('请选择按星期重复或指定日期')
+        if not isinstance(self.schedule_dates,list):
+            raise ValueError('指定日期应为 YYYY-MM-DD 日期列表')
+        for value in self.schedule_dates:
+            try:
+                if not isinstance(value,str) or date.fromisoformat(value).isoformat()!=value:
+                    raise ValueError
+            except (ValueError,TypeError):
+                raise ValueError('指定日期应为 YYYY-MM-DD 格式的有效日期') from None
+        if len(set(self.schedule_dates))!=len(self.schedule_dates):
+            raise ValueError('指定日期不能重复')
+        if self.schedule_enabled and self.schedule_mode=='dates' and not self.schedule_dates:
+            raise ValueError('启用指定日期运行时，请至少添加一个日期')
+        if self.schedule_enabled and self.schedule_mode=='weekdays' and not self.schedule_weekdays:
+            raise ValueError('启用定时运行时，请至少勾选一天')
         if self.close_after_matches and not self.schedule_enabled and self.max_matches < 1:
             raise ValueError('按固定局数关闭时，局数至少为 1')
         if self.preferred_hero not in (2, 3):

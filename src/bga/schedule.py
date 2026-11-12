@@ -1,4 +1,4 @@
-"""Local daily windows and an interactive Windows scheduled launch."""
+"""Local weekly windows and an interactive Windows scheduled launch."""
 from datetime import datetime, timedelta
 import hashlib
 from pathlib import Path
@@ -7,21 +7,35 @@ import sys
 import xml.etree.ElementTree as ET
 
 
+class ScheduleExpired(ValueError):
+    pass
+
+
 def window(config, now=None):
+    config.validate()
+    if config.schedule_mode=='weekdays' and not config.schedule_weekdays:
+        raise ValueError('请至少选择一个运行日期')
     now = now or datetime.now()
     start = datetime.strptime(config.schedule_start, '%H:%M').time()
     end = datetime.strptime(config.schedule_end, '%H:%M').time()
-    begin = datetime.combine(now.date(), start)
-    finish = datetime.combine(now.date(), end)
-    if end < start:
-        finish += timedelta(days=1)
-        if now < datetime.combine(now.date(), end):
-            begin -= timedelta(days=1)
-            finish -= timedelta(days=1)
-    if now >= finish:
-        begin += timedelta(days=1)
-        finish += timedelta(days=1)
-    return begin, finish
+    if config.schedule_mode=='dates':
+        for value in sorted(config.schedule_dates):
+            day=datetime.strptime(value,'%Y-%m-%d').date()
+            begin=datetime.combine(day,start)
+            finish=datetime.combine(day,end)+timedelta(days=int(end<start))
+            if now<finish:
+                return begin,finish
+        raise ScheduleExpired('所选日期已全部结束，请重新设置定时日期')
+    # A cross-midnight session belongs to its starting weekday. Include
+    # yesterday so Tuesday 01:00 can still be inside Monday's session.
+    for offset in range(-1,8):
+        day=now.date()+timedelta(days=offset)
+        if day.weekday() not in config.schedule_weekdays:
+            continue
+        begin=datetime.combine(day,start)
+        finish=datetime.combine(day,end)+timedelta(days=int(end<start))
+        if now<finish:
+            return begin,finish
 
 
 def task_name(root):
@@ -30,17 +44,21 @@ def task_name(root):
 
 def sync_task(config, root):
     """Use the logged-in user's desktop, without storing a password."""
+    config.validate()
     root = Path(root).resolve()
     name = task_name(root)
     hidden = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
     query = subprocess.run(['schtasks.exe', '/Query', '/TN', name], capture_output=True, creationflags=hidden)
-    if not config.schedule_enabled:
+    begin=None
+    if config.schedule_enabled:
+        try:begin,_=window(config)
+        except ScheduleExpired:pass
+    if not config.schedule_enabled or begin is None:
         if query.returncode == 0:
             result = subprocess.run(['schtasks.exe', '/Delete', '/TN', name, '/F'], capture_output=True, creationflags=hidden)
             if result.returncode: raise OSError('无法移除定时启动任务')
         return
     who = subprocess.check_output(['whoami.exe'], text=True, creationflags=hidden).strip()
-    begin, _ = window(config)
     ns = 'http://schemas.microsoft.com/windows/2004/02/mit/task'
     ET.register_namespace('', ns)
     def node(parent, name, value=None, **attrs):
@@ -48,9 +66,23 @@ def sync_task(config, root):
         if value is not None: item.text = str(value)
         return item
     task = ET.Element('{'+ns+'}Task', version='1.2')
-    triggers = node(task, 'Triggers'); trigger = node(triggers, 'CalendarTrigger')
-    node(trigger, 'StartBoundary', begin.isoformat()); node(trigger, 'Enabled', 'true')
-    node(node(trigger, 'ScheduleByDay'), 'DaysInterval', '1')
+    triggers=node(task,'Triggers')
+    if config.schedule_mode=='dates':
+        for value in sorted(config.schedule_dates):
+            day=datetime.strptime(value,'%Y-%m-%d').date()
+            if day<begin.date():continue
+            trigger=node(triggers,'TimeTrigger')
+            boundary=datetime.combine(day,begin.time())
+            node(trigger,'StartBoundary',boundary.isoformat());node(trigger,'Enabled','true')
+    else:
+        trigger=node(triggers,'CalendarTrigger')
+        node(trigger,'StartBoundary',begin.isoformat());node(trigger,'Enabled','true')
+        weekly=node(trigger,'ScheduleByWeek')
+        node(weekly,'WeeksInterval','1')
+        weekdays=node(weekly,'DaysOfWeek')
+        names=('Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday')
+        for day in sorted(config.schedule_weekdays):
+            node(weekdays,names[day])
     principal = node(node(task, 'Principals'), 'Principal', id='User')
     node(principal, 'UserId', who); node(principal, 'LogonType', 'InteractiveToken')
     node(principal, 'RunLevel', 'LeastPrivilege')

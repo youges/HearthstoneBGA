@@ -7,13 +7,14 @@ import time
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QTimer, QThread, QTime
-from PySide6.QtGui import QColor, QFont, QFontDatabase, QImage, QPainter, QPen, QPixmap
+from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QTimer, QThread, QTime, QDate
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QImage, QPainter, QPen, QPixmap, QIcon
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QGridLayout, QGroupBox, QTabWidget, QLineEdit, QCheckBox, QSpinBox, QDoubleSpinBox,
     QComboBox, QFormLayout, QPlainTextEdit, QTableWidget, QTableWidgetItem, QHeaderView, QTimeEdit,
     QFileDialog, QMessageBox, QSplitter, QScrollArea, QFrame, QAbstractItemView,
+    QDateEdit,QListWidget,QStackedWidget,
 )
 
 from . import __version__
@@ -22,6 +23,7 @@ from .model import State, STATE_NAMES
 from .runner import Runner
 from .store import Store
 from .vision import Vision, crop
+from .schedule_widgets import TimeInput
 
 
 STYLE = '''
@@ -208,6 +210,7 @@ class MainWindow(QMainWindow):
     def __init__(self,root=None,config_path=None):
         super().__init__()
         self.root=Path(root or project_root())
+        self.setWindowIcon(QIcon(str(self.root/'assets/ui/app-icon.ico')))
         self.worker=self.analysis=self.capture_thread=None
         self.pending_selection=None
         self.config_path=Path(config_path) if config_path else self.root/'data'/'settings.json'
@@ -387,11 +390,37 @@ class MainWindow(QMainWindow):
                 widget.setMaximumWidth(140);widget.setAlignment(Qt.AlignmentFlag.AlignRight)
                 form.addRow(label,widget)
             self.controls[key]=widget
-        for key,label in [('schedule_start','每天开始时间'),('schedule_end','每天结束时间')]:
-            widget=QTimeEdit(QTime.fromString(getattr(self.config,key),'HH:mm'))
-            widget.setDisplayFormat('HH:mm'); forms['运行与窗口'].addRow(label,widget)
+        self.weekday_checks=[]
+        days=QWidget();days_layout=QGridLayout(days);days_layout.setContentsMargins(0,0,0,0)
+        for day,label in enumerate(('周一','周二','周三','周四','周五','周六','周日')):
+            checkbox=QCheckBox(label);checkbox.setChecked(day in self.config.schedule_weekdays)
+            days_layout.addWidget(checkbox,day//4,day%4);self.weekday_checks.append(checkbox)
+        self.schedule_mode=QComboBox()
+        self.schedule_mode.addItem('按星期重复','weekdays');self.schedule_mode.addItem('指定日期（不重复）','dates')
+        forms['运行与窗口'].addRow('定时日期模式',self.schedule_mode)
+        self.schedule_panels=QStackedWidget();self.schedule_panels.addWidget(days)
+        dates=QWidget();dates_layout=QVBoxLayout(dates);dates_layout.setContentsMargins(0,0,0,0)
+        date_row=QHBoxLayout();self.date_edit=QDateEdit(QDate.currentDate())
+        self.date_edit.setCalendarPopup(True);self.date_edit.setDisplayFormat('yyyy-MM-dd')
+        add_date=QPushButton('添加日期');add_date.clicked.connect(lambda:self.add_schedule_date(self.date_edit.date()))
+        date_row.addWidget(self.date_edit);date_row.addWidget(add_date);dates_layout.addLayout(date_row)
+        self.date_list=QListWidget();self.date_list.setMinimumHeight(85);self.date_list.setMaximumHeight(110)
+        self.date_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        dates_layout.addWidget(self.date_list)
+        remove_date=QPushButton('移除选中日期');remove_date.clicked.connect(self.remove_schedule_dates)
+        dates_layout.addWidget(remove_date)
+        for value in self.config.schedule_dates:self.add_schedule_date(QDate.fromString(value,'yyyy-MM-dd'))
+        self.schedule_panels.addWidget(dates)
+        self.schedule_mode.currentIndexChanged.connect(self.schedule_panels.setCurrentIndex)
+        self.schedule_panels.currentChanged.connect(lambda i:self.schedule_panels.setFixedHeight(self.schedule_panels.widget(i).sizeHint().height()))
+        self.schedule_mode.setCurrentIndex(1 if self.config.schedule_mode=='dates' else 0)
+        self.schedule_panels.setFixedHeight(self.schedule_panels.currentWidget().sizeHint().height())
+        forms['运行与窗口'].addRow('运行日期（开始日）',self.schedule_panels)
+        for key,label in [('schedule_start','开始时间'),('schedule_end','结束时间')]:
+            widget=TimeInput(QTime.fromString(getattr(self.config,key),'HH:mm'))
+            forms['运行与窗口'].addRow(label,widget)
             self.controls[key]=widget
-        hint=QLabel('同时勾选时按时间段运行，忽略局数。支持跨午夜。\n保存后自动等待开始时间；到结束时间立即停止并关闭助手。\n电脑需开机并已登录；未勾选时间段时，局数上限仍可单独停止运行。')
+        hint=QLabel('时间可直接输入 HH:MM，或点击“滚动选择”。\n跨午夜按开始日计算，如周一 22:00 至周二 03:00。\n指定日期不按周重复；所有日期共用同一组时间。\n时间段优先于局数，到时停止并关闭助手。电脑需开机并已登录。')
         hint.setWordWrap(True);forms['运行与窗口'].addRow(hint)
         for section in forms.values():
             for row in range(section.rowCount()):
@@ -566,10 +595,21 @@ class MainWindow(QMainWindow):
         self.analysis=AnalysisThread(self.canvas.frame.copy(),Profile(**json.loads(json.dumps(asdict(self.profile)))),self.root,self.frame_kind.currentData())
         self.analysis.result.connect(self.analysis_text.setPlainText);self.analysis.start()
 
+    def add_schedule_date(self,date):
+        value=date.toString('yyyy-MM-dd')
+        if date.isValid() and not self.date_list.findItems(value,Qt.MatchFlag.MatchExactly):
+            self.date_list.addItem(value);self.date_list.sortItems()
+
+    def remove_schedule_dates(self):
+        for item in self.date_list.selectedItems():self.date_list.takeItem(self.date_list.row(item))
+
     def read_settings(self):
         values=asdict(self.config);values['battle_net_path']=self.path_edit.text().strip()
+        values['schedule_weekdays']=[day for day,control in enumerate(self.weekday_checks) if control.isChecked()]
+        values['schedule_mode']=self.schedule_mode.currentData()
+        values['schedule_dates']=[self.date_list.item(i).text() for i in range(self.date_list.count())]
         for key,control in self.controls.items():
-            if isinstance(control,QTimeEdit):
+            if isinstance(control,(QTimeEdit,TimeInput)):
                 values[key]=control.time().toString('HH:mm');continue
             values[key]=control.isChecked() if isinstance(control,QCheckBox) else control.value()
         config=Config(**values);config.validate();return config
@@ -587,7 +627,7 @@ class MainWindow(QMainWindow):
         from .schedule import sync_task
         previous=self.config
         changed=any(getattr(previous,k)!=getattr(config,k) for k in
-                    ('schedule_enabled','schedule_start','schedule_end'))
+                    ('schedule_enabled','schedule_start','schedule_end','schedule_weekdays','schedule_mode','schedule_dates'))
         config.save(self.config_path)
         try:
             if changed: sync_task(config,self.root)
@@ -600,7 +640,7 @@ class MainWindow(QMainWindow):
 
     def schedule_tick(self):
         from datetime import datetime
-        from .schedule import window
+        from .schedule import window,ScheduleExpired
         if self.closing:return
         if self.worker and self.worker.isRunning():
             deadline=getattr(self.worker,'schedule_deadline',None)
@@ -608,7 +648,9 @@ class MainWindow(QMainWindow):
                 self.worker.end_reason='schedule_end';self.worker.stop()
             return
         if self.schedule_armed and self.config.schedule_enabled:
-            begin,end=window(self.config)
+            try:begin,end=window(self.config)
+            except ScheduleExpired as error:
+                self.schedule_armed=False;self.set_running(False);self.state_label.setText(str(error));return
             if datetime.now()>=begin:
                 self.schedule_armed=False;self.start_run()
             else:
@@ -746,7 +788,13 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    if sys.platform=='win32':
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('youges.HearthstoneBGA')
     app=QApplication(sys.argv)
+    app.setApplicationName('HearthstoneBGA')
+    app.setApplicationDisplayName('酒馆助手')
+    app.setWindowIcon(QIcon(str(project_root()/'assets/ui/app-icon.ico')))
     # Offscreen Qt does not always discover Windows' system font collection.
     # Load installed fonts without redistributing Microsoft's font files.
     import os

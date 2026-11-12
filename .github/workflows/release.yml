@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'src/**'
+      - 'assets/ui/**'
       - 'tests/**'
       - 'scripts/**'
       - 'pyproject.toml'

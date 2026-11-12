@@ -155,7 +155,7 @@ def board_count(frame,empty):
     area=difference[415:550,340:1190]
     if area.mean()<.045:
         return 0
-    fits=[]
+    fits={}
     for n in range(1,8):
         xs=[768+(i-(n-1)/2)*112 for i in range(n)]
         core=min(difference[425:490,int(x-25):int(x+25)].mean() for x in xs)
@@ -166,9 +166,19 @@ def board_count(frame,empty):
         # Gold/shielded minions can resemble the empty tavern's brown pixels.
         # Use finer color differences only when almost all strong changes fit
         # the slot row; animation and tooltip rejection still runs first.
-        if (core>=.55 and outside.mean()<.08) or (fine_core>=.65 and outside.mean()<.04):
-            fits.append(n)
-    return fits[0] if len(fits)==1 else None
+        residual=outside.mean()
+        if (core>=.55 and residual<.08) or (fine_core>=.65 and residual<.04):
+            fits[n]=(fine_core,residual)
+    if len(fits)==1:
+        return next(iter(fits))
+    if fits.keys()=={1,2}:
+        _,single_residual=fits[1]
+        pair_core,pair_residual=fits[2]
+        # Adjacent shielded minions can also fill the central single slot.
+        # Require strong evidence in both slots and little change outside them.
+        if pair_core>=.85 and pair_residual<=.02 and single_residual>=.06 and single_residual-pair_residual>=.045:
+            return 2
+    return None
 
 
 def components(mask,area=85):
